@@ -4,6 +4,8 @@
 
 驿传是一款基于 **WebSocket + UDP 广播** 的局域网文件传输应用，无需互联网、无需数据线，通过 6 位配对码一键连接，实现设备间高速文件传输。
 
+<img width="1600" height="1264" alt="image" src="https://github.com/user-attachments/assets/ece05556-a8dc-470e-bb1b-d1d0f8a84b6d" />
+
 ## ✨ 特性
 
 - **🔗 简单配对** — 6 位配对码连接，无需账号、无需扫码
