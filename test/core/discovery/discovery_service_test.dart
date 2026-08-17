@@ -67,73 +67,90 @@ void main() {
     test('returns list of recently discovered devices', () {
       service.startScanning();
       service.injectDiscoveredDevice(
-        deviceId: 'd1', deviceName: 'M1', platform: DevicePlatform.macos,
-        ip: '10.0.0.1', port: 45678,
+        deviceId: 'd1',
+        deviceName: 'M1',
+        platform: DevicePlatform.macos,
+        ip: '10.0.0.1',
+        port: 45678,
       );
       service.injectDiscoveredDevice(
-        deviceId: 'd2', deviceName: 'PC1', platform: DevicePlatform.windows,
-        ip: '10.0.0.2', port: 45679,
+        deviceId: 'd2',
+        deviceName: 'PC1',
+        platform: DevicePlatform.windows,
+        ip: '10.0.0.2',
+        port: 45679,
       );
 
       final devices = service.recentDevices;
       expect(devices, hasLength(2));
     });
 
-    test('deduplicates discovered devices by IP and keeps useful device name', () {
-      service.startScanning();
-      service.injectDiscoveredDevice(
-        deviceId: 'scanned-10.0.0.5',
-        deviceName: 'localhost',
-        platform: DevicePlatform.macos,
-        ip: '10.0.0.5',
-        port: 45678,
-      );
-      service.injectDiscoveredDevice(
-        deviceId: 'desktop-1',
-        deviceName: 'Mac Studio',
-        platform: DevicePlatform.macos,
-        ip: '10.0.0.5',
-        port: 45678,
-      );
+    test(
+      'deduplicates discovered devices by IP and keeps useful device name',
+      () {
+        service.startScanning();
+        service.injectDiscoveredDevice(
+          deviceId: 'scanned-10.0.0.5',
+          deviceName: 'localhost',
+          platform: DevicePlatform.macos,
+          ip: '10.0.0.5',
+          port: 45678,
+        );
+        service.injectDiscoveredDevice(
+          deviceId: 'desktop-1',
+          deviceName: 'Mac Studio',
+          platform: DevicePlatform.macos,
+          ip: '10.0.0.5',
+          port: 45678,
+        );
 
-      final devices = service.recentDevices;
-      expect(devices, hasLength(1));
-      expect(devices.first.deviceId, 'desktop-1');
-      expect(devices.first.deviceName, 'Mac Studio');
-      expect(devices.first.ip, '10.0.0.5');
-    });
+        final devices = service.recentDevices;
+        expect(devices, hasLength(1));
+        expect(devices.first.deviceId, 'desktop-1');
+        expect(devices.first.deviceName, 'Mac Studio');
+        expect(devices.first.ip, '10.0.0.5');
+      },
+    );
 
-    test('keeps existing useful name when later scan only has fallback name', () {
-      service.startScanning();
-      service.injectDiscoveredDevice(
-        deviceId: 'desktop-1',
-        deviceName: 'Mac Studio',
-        platform: DevicePlatform.macos,
-        ip: '10.0.0.5',
-        port: 45678,
-      );
-      service.injectDiscoveredDevice(
-        deviceId: 'scanned-10.0.0.5',
-        deviceName: '未知设备 (10.0.0.5)',
-        platform: DevicePlatform.macos,
-        ip: '10.0.0.5',
-        port: 45678,
-      );
+    test(
+      'keeps existing useful name when later scan only has fallback name',
+      () {
+        service.startScanning();
+        service.injectDiscoveredDevice(
+          deviceId: 'desktop-1',
+          deviceName: 'Mac Studio',
+          platform: DevicePlatform.macos,
+          ip: '10.0.0.5',
+          port: 45678,
+        );
+        service.injectDiscoveredDevice(
+          deviceId: 'scanned-10.0.0.5',
+          deviceName: '未知设备 (10.0.0.5)',
+          platform: DevicePlatform.macos,
+          ip: '10.0.0.5',
+          port: 45678,
+        );
 
-      final devices = service.recentDevices;
-      expect(devices, hasLength(1));
-      expect(devices.first.deviceId, 'desktop-1');
-      expect(devices.first.deviceName, 'Mac Studio');
-    });
+        final devices = service.recentDevices;
+        expect(devices, hasLength(1));
+        expect(devices.first.deviceId, 'desktop-1');
+        expect(devices.first.deviceName, 'Mac Studio');
+      },
+    );
 
     test('removes expired devices from recent list', () async {
-      service = DiscoveryService(discoveryTtl: const Duration(milliseconds: 50));
+      service = DiscoveryService(
+        discoveryTtl: const Duration(milliseconds: 50),
+      );
       service.addListener((device) => discoveredDevices.add(device));
       service.startScanning();
 
       service.injectDiscoveredDevice(
-        deviceId: 'd1', deviceName: 'Expired', platform: DevicePlatform.macos,
-        ip: '10.0.0.1', port: 45678,
+        deviceId: 'd1',
+        deviceName: 'Expired',
+        platform: DevicePlatform.macos,
+        ip: '10.0.0.1',
+        port: 45678,
       );
 
       // Wait past TTL

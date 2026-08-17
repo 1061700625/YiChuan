@@ -1,84 +1,75 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:local_mesh_transfer/core/network/network_service.dart';
 import 'package:local_mesh_transfer/core/protocol/protocol_message.dart';
+
+ProtocolMessage _hello(String deviceId) => ProtocolMessage(
+  type: ProtocolMessageType.hello,
+  version: 1,
+  messageId: 'hello-$deviceId',
+  timestamp: DateTime.utc(2026),
+  payload: {'deviceId': deviceId},
+);
 
 void main() {
   group('InMemoryNetworkService', () {
     late InMemoryNetworkService service;
 
-    setUp(() {
-      service = InMemoryNetworkService();
-    });
+    setUp(() => service = InMemoryNetworkService());
 
-    test('starts as disconnected', () {
-      expect(service.connectionState, NetworkConnectionState.disconnected);
-    });
-
-    test('opens server listener and transitions to listening', () async {
+    test('opens server listener', () async {
       await service.startServer(port: 45678);
-
       expect(service.connectionState, NetworkConnectionState.listening);
       expect(service.listeningPort, 45678);
     });
 
-    test('connects to remote host and transitions to connected', () async {
+    test('routes a message with its source client ID', () async {
       await service.startServer(port: 45678);
-      final incoming = <ProtocolMessage>[];
-      service.onMessageReceived = (msg) => incoming.add(msg);
-
-      // Simulate a client connecting
+      final received = <(String, ProtocolMessage)>[];
+      service.onMessageReceived = (clientId, message) =>
+          received.add((clientId, message));
       final clientId = await service.injectClientConnection(
         deviceId: 'phone-1',
         deviceName: 'Pixel',
         host: '192.168.1.50',
       );
 
-      expect(clientId, isNotNull);
-      expect(service.connectionState, NetworkConnectionState.connected);
+      await service.injectMessageFrom(clientId, _hello('phone-1'));
+
+      expect(received.single.$1, clientId);
+      expect(received.single.$2.payload['deviceId'], 'phone-1');
     });
 
-    test('sends message to connected client', () async {
-      await service.startServer(port: 45678);
-      final clientId = await service.injectClientConnection(
-        deviceId: 'phone-1', deviceName: 'Pixel', host: '192.168.1.50',
+    test('rejects sends to a different client ID', () async {
+      await service.connect(host: '127.0.0.1', port: 45678);
+      expect(await service.send('missing', _hello('desktop-1')), isFalse);
+      expect(
+        await service.sendBinary('missing', Uint8List.fromList([1])),
+        isFalse,
       );
-
-      final sent = await service.send(clientId!, ProtocolMessage.hello(
-        messageId: 'msg-1', timestamp: DateTime.utc(2026, 1, 1),
-        deviceId: 'desktop-1', deviceName: 'Mac', platform: 'macos', port: 45678,
-      ));
-
-      expect(sent, isTrue);
-      expect(service.messageLog, hasLength(1));
     });
 
-    test('receives message from client and notifies callback', () async {
-      await service.startServer(port: 45678);
-      final incoming = <ProtocolMessage>[];
-      service.onMessageReceived = (msg) => incoming.add(msg);
-
+    test('routes a binary frame with its source client ID', () async {
+      final received = <(String, Uint8List)>[];
+      service.onBinaryReceived = (clientId, data) =>
+          received.add((clientId, data));
       final clientId = await service.injectClientConnection(
-        deviceId: 'phone-1', deviceName: 'Pixel', host: '192.168.1.50',
+        deviceId: 'phone-1',
+        deviceName: 'Pixel',
+        host: '192.168.1.50',
       );
+      final frame = Uint8List.fromList([1, 2, 3, 4]);
 
-      await service.injectMessageFrom(clientId!, ProtocolMessage.hello(
-        messageId: 'msg-2', timestamp: DateTime.utc(2026, 1, 1),
-        deviceId: 'phone-1', deviceName: 'Pixel', platform: 'android', port: 45678,
-      ));
+      await service.injectBinaryFrom(clientId, frame);
 
-      expect(incoming, hasLength(1));
-      expect(incoming.first.type, ProtocolMessageType.hello);
-      expect(incoming.first.payload['deviceId'], 'phone-1');
+      expect(received.single.$1, clientId);
+      expect(received.single.$2, orderedEquals(frame));
     });
 
     test('disconnects and cleans up state', () async {
-      await service.startServer(port: 45678);
-      final clientId = await service.injectClientConnection(
-        deviceId: 'phone-1', deviceName: 'Pixel', host: '192.168.1.50',
-      );
-
+      final clientId = await service.connect(host: '127.0.0.1', port: 45678);
       await service.disconnect(clientId!);
-
       expect(service.connectionState, NetworkConnectionState.disconnected);
       expect(service.connectedClients, isEmpty);
     });

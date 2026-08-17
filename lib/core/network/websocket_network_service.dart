@@ -1,18 +1,21 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import '../protocol/protocol_message.dart';
 import 'network_service.dart';
 
 class WebSocketNetworkService implements NetworkService {
+  static const _pingInterval = Duration(seconds: 20);
   HttpServer? _server;
-  final _clients = <String, _WsClient>{};
+  final _clients = <String, WebSocket>{};
   int _nextId = 1;
   NetworkConnectionState _state = NetworkConnectionState.disconnected;
   int? _listeningPort;
   bool _isInitiator = false;
-  void Function(ProtocolMessage message)? _onMessageReceived;
+  MessageReceivedCallback? _onMessageReceived;
+  BinaryReceivedCallback? _onBinaryReceived;
   void Function(String clientId)? _onClientConnected;
   void Function(String clientId)? _onClientDisconnected;
 
@@ -29,22 +32,34 @@ class WebSocketNetworkService implements NetworkService {
   List<String> get connectedClients => _clients.keys.toList(growable: false);
 
   @override
-  void Function(ProtocolMessage message)? get onMessageReceived => _onMessageReceived;
+  MessageReceivedCallback? get onMessageReceived => _onMessageReceived;
 
   @override
-  set onMessageReceived(void Function(ProtocolMessage message)? callback) {
+  set onMessageReceived(MessageReceivedCallback? callback) {
     _onMessageReceived = callback;
   }
 
   @override
-  void Function(String clientId)? get onClientDisconnected => _onClientDisconnected;
+  BinaryReceivedCallback? get onBinaryReceived => _onBinaryReceived;
+
+  @override
+  set onBinaryReceived(BinaryReceivedCallback? callback) {
+    _onBinaryReceived = callback;
+  }
+
+  @override
+  void Function(String clientId)? get onClientDisconnected =>
+      _onClientDisconnected;
 
   @override
   set onClientDisconnected(void Function(String clientId)? callback) {
     _onClientDisconnected = callback;
   }
 
-  /// Callback invoked when a new client connects to this server.
+  @override
+  void Function(String clientId)? get onClientConnected => _onClientConnected;
+
+  @override
   set onClientConnected(void Function(String clientId)? callback) {
     _onClientConnected = callback;
   }
@@ -58,32 +73,15 @@ class WebSocketNetworkService implements NetworkService {
     _server!.listen((HttpRequest request) async {
       if (WebSocketTransformer.isUpgradeRequest(request)) {
         final webSocket = await WebSocketTransformer.upgrade(request);
+        webSocket.pingInterval = _pingInterval;
         final id = 'client_${_nextId++}';
-        final client = _WsClient(id: id, socket: webSocket);
-        _clients[id] = client;
+        _clients[id] = webSocket;
         _state = NetworkConnectionState.connected;
 
         // Notify server that a new client connected (for hello announcement)
         _onClientConnected?.call(id);
 
-        webSocket.listen(
-          (data) {
-            try {
-              final json = jsonDecode(data as String) as Map<String, Object?>;
-              final message = ProtocolMessage.fromJson(json);
-              _onMessageReceived?.call(message);
-            } catch (_) {}
-          },
-          onDone: () {
-            // Only fire callback if disconnect() hasn't already removed this client
-            if (_clients.remove(id) != null) {
-              _onClientDisconnected?.call(id);
-            }
-            if (_clients.isEmpty) {
-              _state = _server != null ? NetworkConnectionState.listening : NetworkConnectionState.disconnected;
-            }
-          },
-        );
+        unawaited(_listenToClient(id, webSocket));
       } else {
         request.response.statusCode = 400;
         request.response.close();
@@ -97,32 +95,13 @@ class WebSocketNetworkService implements NetworkService {
   Future<String?> connect({required String host, required int port}) async {
     try {
       final socket = await WebSocket.connect('ws://$host:$port');
+      socket.pingInterval = _pingInterval;
       final id = 'client_${_nextId++}';
-      final client = _WsClient(id: id, socket: socket);
-      _clients[id] = client;
+      _clients[id] = socket;
       _state = NetworkConnectionState.connected;
       _isInitiator = true;
 
-      socket.listen(
-        (data) {
-          try {
-            final json = jsonDecode(data as String) as Map<String, Object?>;
-            final message = ProtocolMessage.fromJson(json);
-            _onMessageReceived?.call(message);
-          } catch (_) {}
-        },
-        onDone: () {
-          // Only fire callback + update state if disconnect() hasn't already
-          // removed this client. Avoids race between explicit disconnect and
-          // the async onDone event (socket.close → onDone).
-          if (_clients.remove(id) != null) {
-            _onClientDisconnected?.call(id);
-          }
-          if (_clients.isEmpty) {
-            _state = _server != null ? NetworkConnectionState.listening : NetworkConnectionState.disconnected;
-          }
-        },
-      );
+      unawaited(_listenToClient(id, socket));
 
       return id;
     } catch (_) {
@@ -136,7 +115,7 @@ class WebSocketNetworkService implements NetworkService {
     if (client == null) return false;
 
     try {
-      client.socket.add(jsonEncode(message.toJson()));
+      client.add(jsonEncode(message.toJson()));
       return true;
     } catch (_) {
       return false;
@@ -144,19 +123,72 @@ class WebSocketNetworkService implements NetworkService {
   }
 
   @override
+  Future<bool> sendBinary(String clientId, Uint8List data) async {
+    final client = _clients[clientId];
+    if (client == null) return false;
+
+    try {
+      client.add(data);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _handleIncomingData(String clientId, dynamic data) async {
+    try {
+      if (data is String) {
+        final json = jsonDecode(data) as Map<String, Object?>;
+        await _onMessageReceived?.call(
+          clientId,
+          ProtocolMessage.fromJson(json),
+        );
+      } else if (data is List<int>) {
+        await _onBinaryReceived?.call(
+          clientId,
+          data is Uint8List ? data : Uint8List.fromList(data),
+        );
+      }
+    } catch (_) {
+      // Ignore malformed or unsupported frames.
+    }
+  }
+
+  Future<void> _listenToClient(String clientId, WebSocket socket) async {
+    try {
+      await for (final data in socket) {
+        await _handleIncomingData(clientId, data);
+      }
+    } catch (_) {
+      // A closed or malformed connection is handled like a normal disconnect.
+    } finally {
+      if (_clients.remove(clientId) != null) {
+        _onClientDisconnected?.call(clientId);
+      }
+      if (_clients.isEmpty) {
+        _state = _server != null
+            ? NetworkConnectionState.listening
+            : NetworkConnectionState.disconnected;
+      }
+    }
+  }
+
+  @override
   Future<void> disconnect(String clientId) async {
     final client = _clients.remove(clientId);
-    await client?.socket.close();
+    await client?.close();
     _onClientDisconnected?.call(clientId);
     if (_clients.isEmpty) {
-      _state = _server != null ? NetworkConnectionState.listening : NetworkConnectionState.disconnected;
+      _state = _server != null
+          ? NetworkConnectionState.listening
+          : NetworkConnectionState.disconnected;
     }
   }
 
   @override
   Future<void> stopServer() async {
     for (final client in _clients.values) {
-      await client.socket.close();
+      await client.close();
     }
     _clients.clear();
     await _server?.close(force: true);
@@ -169,10 +201,4 @@ class WebSocketNetworkService implements NetworkService {
   void dispose() {
     stopServer();
   }
-}
-
-class _WsClient {
-  _WsClient({required this.id, required this.socket});
-  final String id;
-  final WebSocket socket;
 }

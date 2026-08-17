@@ -11,10 +11,43 @@ Future<bool> requestNearbyDevicesPermission() async {
   if (!Platform.isAndroid) return true;
 
   try {
-    final granted = await _permissionChannel.invokeMethod<bool>('requestNearbyDevices');
+    final granted = await _permissionChannel.invokeMethod<bool>(
+      'requestNearbyDevices',
+    );
     return granted ?? false;
   } catch (_) {
     return true;
+  }
+}
+
+Future<bool> requestNotificationPermission() async {
+  if (!Platform.isAndroid) return true;
+  try {
+    return await _permissionChannel.invokeMethod<bool>(
+          'requestNotifications',
+        ) ??
+        false;
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<bool> startConnectionForegroundService() async {
+  if (!Platform.isAndroid) return true;
+  try {
+    return await _networkChannel.invokeMethod<bool>('startConnectionService') ??
+        false;
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<void> stopConnectionForegroundService() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await _networkChannel.invokeMethod<void>('stopConnectionService');
+  } catch (_) {
+    // ignore
   }
 }
 
@@ -24,7 +57,9 @@ Future<bool> acquireMulticastLock() async {
   if (!Platform.isAndroid) return true;
 
   try {
-    final result = await _networkChannel.invokeMethod<bool>('acquireMulticastLock');
+    final result = await _networkChannel.invokeMethod<bool>(
+      'acquireMulticastLock',
+    );
     return result ?? false;
   } catch (_) {
     return false;

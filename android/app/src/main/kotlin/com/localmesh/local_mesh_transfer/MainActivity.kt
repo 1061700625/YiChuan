@@ -12,6 +12,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
+import android.webkit.MimeTypeMap
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
@@ -26,10 +27,12 @@ class MainActivity : FlutterActivity() {
         private const val FILEPICKER_CHANNEL = "com.localmesh/filepicker"
         private const val REQUEST_NEARBY_DEVICES = 1001
         private const val REQUEST_PICK_FILE = 1002
+        private const val REQUEST_NOTIFICATIONS = 1003
     }
 
     private var pendingNearbyResult: MethodChannel.Result? = null
     private var pendingFilePickerResult: MethodChannel.Result? = null
+    private var pendingNotificationResult: MethodChannel.Result? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -68,6 +71,23 @@ class MainActivity : FlutterActivity() {
                                 this,
                                 Manifest.permission.NEARBY_WIFI_DEVICES
                             ) == PackageManager.PERMISSION_GRANTED
+                        )
+                    } else {
+                        result.success(true)
+                    }
+                }
+                "requestNotifications" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        ContextCompat.checkSelfPermission(
+                            this,
+                            Manifest.permission.POST_NOTIFICATIONS
+                        ) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        pendingNotificationResult = result
+                        ActivityCompat.requestPermissions(
+                            this,
+                            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                            REQUEST_NOTIFICATIONS
                         )
                     } else {
                         result.success(true)
@@ -112,6 +132,18 @@ class MainActivity : FlutterActivity() {
                         Settings.Global.DEVICE_NAME
                     )
                     result.success(androidName ?: Build.MODEL ?: "Android 设备")
+                }
+                "startConnectionService" -> {
+                    try {
+                        ConnectionForegroundService.start(this)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("FOREGROUND_SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "stopConnectionService" -> {
+                    ConnectionForegroundService.stop(this)
+                    result.success(true)
                 }
                 else -> result.notImplemented()
             }
@@ -173,23 +205,30 @@ class MainActivity : FlutterActivity() {
                             return@setMethodCallHandler
                         }
 
-                        // Copy temp file content to MediaStore destination
-                        contentResolver.openOutputStream(uri)?.use { output ->
-                            tempFile.inputStream().use { input ->
-                                input.copyTo(output)
+                        try {
+                            val output = contentResolver.openOutputStream(uri)
+                                ?: throw IllegalStateException("Failed to open MediaStore output")
+                            output.use {
+                                tempFile.inputStream().use { input -> input.copyTo(it) }
                             }
+
+                            // Mark as not pending only after the full copy succeeds.
+                            val updateValues = ContentValues().apply {
+                                put(MediaStore.Downloads.IS_PENDING, 0)
+                            }
+                            if (contentResolver.update(uri, updateValues, null, null) != 1) {
+                                throw IllegalStateException("Failed to publish MediaStore entry")
+                            }
+
+                            if (!tempFile.delete()) {
+                                throw IllegalStateException("Failed to remove temporary file")
+                            }
+
+                            result.success(uri.toString())
+                        } catch (e: Exception) {
+                            contentResolver.delete(uri, null, null)
+                            throw e
                         }
-
-                        // Mark as not pending (visible to user)
-                        val updateValues = ContentValues().apply {
-                            put(MediaStore.Downloads.IS_PENDING, 0)
-                        }
-                        contentResolver.update(uri, updateValues, null, null)
-
-                        // Clean up temp file
-                        tempFile.delete()
-
-                        result.success(uri.toString())
                     } catch (e: Exception) {
                         result.error("MOVE_ERROR", "Failed to move file: ${e.message}", null)
                     }
@@ -211,6 +250,19 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     } catch (e: Exception) {
                         result.error("OPEN_ERROR", "Failed to open file: ${e.message}", null)
+                    }
+                }
+                "deleteFile" -> {
+                    val uriStr = call.argument<String>("uri")
+                    if (uriStr == null) {
+                        result.error("INVALID_ARGS", "uri required", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val deleted = contentResolver.delete(Uri.parse(uriStr), null, null)
+                        result.success(deleted > 0)
+                    } catch (e: Exception) {
+                        result.error("DELETE_ERROR", "Failed to delete file: ${e.message}", null)
                     }
                 }
                 "openLocalFile" -> {
@@ -237,6 +289,20 @@ class MainActivity : FlutterActivity() {
                         result.error("OPEN_ERROR", "Failed to open local file: ${e.message}", null)
                     }
                 }
+                "openExternalUrl" -> {
+                    val url = call.argument<String>("url")
+                    val uri = url?.let(Uri::parse)
+                    if (uri == null || uri.scheme != "https" || uri.host.isNullOrEmpty()) {
+                        result.error("INVALID_URL", "A valid HTTPS URL is required", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        startActivity(Intent(Intent.ACTION_VIEW, uri))
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("OPEN_URL_ERROR", e.message, null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
@@ -254,6 +320,11 @@ class MainActivity : FlutterActivity() {
                 grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
             )
             pendingNearbyResult = null
+        } else if (requestCode == REQUEST_NOTIFICATIONS) {
+            pendingNotificationResult?.success(
+                grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            )
+            pendingNotificationResult = null
         }
     }
 
@@ -266,14 +337,16 @@ class MainActivity : FlutterActivity() {
                     // Copy file from content URI to cache dir so dart:io can access it
                     val cacheDir = cacheDir
                     val cacheFile = File(cacheDir, "picked_${System.currentTimeMillis()}")
-                    applicationContext.contentResolver.openInputStream(uri)?.use { input ->
-                        cacheFile.outputStream().use { output ->
-                            input.copyTo(output)
-                        }
+                    val input = applicationContext.contentResolver.openInputStream(uri)
+                        ?: throw IllegalStateException("Unable to open selected file")
+                    input.use {
+                        cacheFile.outputStream().use { output -> it.copyTo(output) }
                     }
                     val name = getDisplayName(uri) ?: "unknown"
                     val size = cacheFile.length()
-                    pendingFilePickerResult?.success("${cacheFile.absolutePath}|$name|$size")
+                    pendingFilePickerResult?.success(
+                        mapOf("path" to cacheFile.absolutePath, "name" to name, "size" to size)
+                    )
                     pendingFilePickerResult = null
                     return
                 } catch (_: Exception) {}
@@ -306,17 +379,8 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun getMimeType(fileName: String): String {
-        return when {
-            fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") -> "image/jpeg"
-            fileName.endsWith(".png") -> "image/png"
-            fileName.endsWith(".gif") -> "image/gif"
-            fileName.endsWith(".webp") -> "image/webp"
-            fileName.endsWith(".mp4") -> "video/mp4"
-            fileName.endsWith(".mp3") -> "audio/mpeg"
-            fileName.endsWith(".pdf") -> "application/pdf"
-            fileName.endsWith(".zip") -> "application/zip"
-            fileName.endsWith(".apk") -> "application/vnd.android.package-archive"
-            else -> "application/octet-stream"
-        }
+        val extension = MimeTypeMap.getFileExtensionFromUrl(fileName).lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+            ?: "application/octet-stream"
     }
 }

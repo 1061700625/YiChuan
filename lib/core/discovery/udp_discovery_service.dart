@@ -37,21 +37,24 @@ class UdpDiscoveryService extends DiscoveryService {
 
     // Send discovery broadcast every 5 seconds
     _broadcastTimer?.cancel();
-    _broadcastTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (_sendSocket == null) return;
-      final message = '$_discoveryTag|$deviceId|$deviceName|${platform.name}|$servicePort';
-      final data = utf8.encode(message);
-      _sendSocket!.send(
-        data,
-        InternetAddress('255.255.255.255'),
-        _broadcastPort,
-      );
-    });
+    _broadcastTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => _sendPublishedService(),
+    );
 
     // Also immediately send one
-    final msg = '$_discoveryTag|$deviceId|$deviceName|${platform.name}|$servicePort';
-    _sendSocket!.send(
-      utf8.encode(msg),
+    _sendPublishedService();
+  }
+
+  void _sendPublishedService() {
+    final socket = _sendSocket;
+    final service = publishedService;
+    if (socket == null || service == null) return;
+    final message =
+        '$_discoveryTag|${service.deviceId}|${service.deviceName}|'
+        '${service.platform.wireName}|${service.port}';
+    socket.send(
+      utf8.encode(message),
       InternetAddress('255.255.255.255'),
       _broadcastPort,
     );
@@ -93,12 +96,7 @@ class UdpDiscoveryService extends DiscoveryService {
           final self = publishedService;
           if (self != null && deviceId == self.deviceId) return;
 
-          final platform = switch (platformStr) {
-            'macos' => DevicePlatform.macos,
-            'windows' => DevicePlatform.windows,
-            'android' => DevicePlatform.android,
-            _ => DevicePlatform.macos,
-          };
+          final platform = DevicePlatform.fromWireName(platformStr);
 
           injectDiscoveredDevice(
             deviceId: deviceId,

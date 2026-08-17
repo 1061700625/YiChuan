@@ -3,12 +3,11 @@ enum ProtocolMessageType {
   pairRequest('pair_request'),
   pairResult('pair_result'),
   transferOffer('transfer_offer'),
-  transferAccept('transfer_accept'),
-  chunk('chunk'),
+  transferResumeRequest('transfer_resume_request'),
+  transferResumeResult('transfer_resume_result'),
+  textMessage('text_message'),
   progress('progress'),
-  retryRequest('retry_request'),
-  transferDone('transfer_done'),
-  error('error');
+  transferDone('transfer_done');
 
   const ProtocolMessageType(this.wireName);
 
@@ -34,32 +33,12 @@ class ProtocolMessage {
     this.sessionId,
   });
 
-  factory ProtocolMessage.hello({
-    required String messageId,
-    required DateTime timestamp,
-    required String deviceId,
-    required String deviceName,
-    required String platform,
-    required int port,
-  }) {
-    return ProtocolMessage(
-      type: ProtocolMessageType.hello,
-      version: 1,
-      messageId: messageId,
-      timestamp: timestamp,
-      payload: {
-        'deviceId': deviceId,
-        'deviceName': deviceName,
-        'platform': platform,
-        'port': port,
-      },
-    );
-  }
-
   factory ProtocolMessage.fromJson(Map<String, Object?> json) {
     final payload = json['payload'];
     if (payload is! Map) {
-      throw const FormatException('Protocol message payload must be an object.');
+      throw const FormatException(
+        'Protocol message payload must be an object.',
+      );
     }
 
     return ProtocolMessage(

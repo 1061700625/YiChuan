@@ -1,13 +1,25 @@
+import 'dart:async';
+import 'dart:typed_data';
+
 import '../protocol/protocol_message.dart';
 
 enum NetworkConnectionState { disconnected, listening, connected }
+
+typedef MessageReceivedCallback =
+    FutureOr<void> Function(String clientId, ProtocolMessage message);
+typedef BinaryReceivedCallback =
+    FutureOr<void> Function(String clientId, Uint8List data);
 
 abstract class NetworkService {
   NetworkConnectionState get connectionState;
   int? get listeningPort;
   List<String> get connectedClients;
-  void Function(ProtocolMessage message)? get onMessageReceived;
-  set onMessageReceived(void Function(ProtocolMessage message)? callback);
+  MessageReceivedCallback? get onMessageReceived;
+  set onMessageReceived(MessageReceivedCallback? callback);
+  BinaryReceivedCallback? get onBinaryReceived;
+  set onBinaryReceived(BinaryReceivedCallback? callback);
+  void Function(String clientId)? get onClientConnected;
+  set onClientConnected(void Function(String clientId)? callback);
   void Function(String clientId)? get onClientDisconnected;
   set onClientDisconnected(void Function(String clientId)? callback);
   bool get isInitiator;
@@ -15,6 +27,7 @@ abstract class NetworkService {
   Future<int> startServer({required int port});
   Future<String?> connect({required String host, required int port});
   Future<bool> send(String clientId, ProtocolMessage message);
+  Future<bool> sendBinary(String clientId, Uint8List data);
   Future<void> disconnect(String clientId);
   Future<void> stopServer();
 }
@@ -22,12 +35,14 @@ abstract class NetworkService {
 class InMemoryNetworkService implements NetworkService {
   NetworkConnectionState _state = NetworkConnectionState.disconnected;
   int? _listeningPort;
-  void Function(ProtocolMessage message)? _onMessageReceived;
+  MessageReceivedCallback? _onMessageReceived;
+  BinaryReceivedCallback? _onBinaryReceived;
+  void Function(String clientId)? _onClientConnected;
   void Function(String clientId)? _onClientDisconnected;
-  final _clients = <String, _ClientConnection>{};
+  final _clients = <String>{};
   int _nextId = 1;
   final _messageLog = <ProtocolMessage>[];
-  final _pendingIncoming = <String, List<ProtocolMessage>>{};
+  final _binaryMessageLog = <Uint8List>[];
 
   @override
   NetworkConnectionState get connectionState => _state;
@@ -36,15 +51,32 @@ class InMemoryNetworkService implements NetworkService {
   int? get listeningPort => _listeningPort;
 
   @override
-  void Function(ProtocolMessage message)? get onMessageReceived => _onMessageReceived;
+  MessageReceivedCallback? get onMessageReceived => _onMessageReceived;
 
   @override
-  set onMessageReceived(void Function(ProtocolMessage message)? callback) {
+  set onMessageReceived(MessageReceivedCallback? callback) {
     _onMessageReceived = callback;
   }
 
   @override
-  void Function(String clientId)? get onClientDisconnected => _onClientDisconnected;
+  BinaryReceivedCallback? get onBinaryReceived => _onBinaryReceived;
+
+  @override
+  set onBinaryReceived(BinaryReceivedCallback? callback) {
+    _onBinaryReceived = callback;
+  }
+
+  @override
+  void Function(String clientId)? get onClientConnected => _onClientConnected;
+
+  @override
+  set onClientConnected(void Function(String clientId)? callback) {
+    _onClientConnected = callback;
+  }
+
+  @override
+  void Function(String clientId)? get onClientDisconnected =>
+      _onClientDisconnected;
 
   @override
   set onClientDisconnected(void Function(String clientId)? callback) {
@@ -57,9 +89,10 @@ class InMemoryNetworkService implements NetworkService {
   bool get isInitiator => _isInitiator;
 
   List<ProtocolMessage> get messageLog => List.unmodifiable(_messageLog);
+  List<Uint8List> get binaryMessageLog => List.unmodifiable(_binaryMessageLog);
 
   @override
-  List<String> get connectedClients => _clients.keys.toList(growable: false);
+  List<String> get connectedClients => _clients.toList(growable: false);
 
   @override
   Future<int> startServer({required int port}) async {
@@ -71,7 +104,7 @@ class InMemoryNetworkService implements NetworkService {
   @override
   Future<String?> connect({required String host, required int port}) async {
     final id = 'client_${_nextId++}';
-    _clients[id] = _ClientConnection(host: host, port: port);
+    _clients.add(id);
     _state = NetworkConnectionState.connected;
     _isInitiator = true;
     return id;
@@ -79,10 +112,15 @@ class InMemoryNetworkService implements NetworkService {
 
   @override
   Future<bool> send(String clientId, ProtocolMessage message) async {
-    if (!_clients.containsKey(clientId) && _state != NetworkConnectionState.connected) {
-      return false;
-    }
+    if (!_clients.contains(clientId)) return false;
     _messageLog.add(message);
+    return true;
+  }
+
+  @override
+  Future<bool> sendBinary(String clientId, Uint8List data) async {
+    if (!_clients.contains(clientId)) return false;
+    _binaryMessageLog.add(Uint8List.fromList(data));
     return true;
   }
 
@@ -92,14 +130,23 @@ class InMemoryNetworkService implements NetworkService {
     required String host,
   }) async {
     final id = 'client_${_nextId++}';
-    _clients[id] = _ClientConnection(host: host, port: 0, deviceId: deviceId, deviceName: deviceName);
+    _clients.add(id);
     _state = NetworkConnectionState.connected;
+    _onClientConnected?.call(id);
     return id;
   }
 
-  Future<void> injectMessageFrom(String clientId, ProtocolMessage message) async {
+  Future<void> injectMessageFrom(
+    String clientId,
+    ProtocolMessage message,
+  ) async {
     _messageLog.add(message);
-    _onMessageReceived?.call(message);
+    await _onMessageReceived?.call(clientId, message);
+  }
+
+  Future<void> injectBinaryFrom(String clientId, Uint8List data) async {
+    _binaryMessageLog.add(Uint8List.fromList(data));
+    await _onBinaryReceived?.call(clientId, data);
   }
 
   @override
@@ -119,18 +166,4 @@ class InMemoryNetworkService implements NetworkService {
     _state = NetworkConnectionState.disconnected;
     _isInitiator = false;
   }
-}
-
-class _ClientConnection {
-  const _ClientConnection({
-    required this.host,
-    required this.port,
-    this.deviceId,
-    this.deviceName,
-  });
-
-  final String host;
-  final int port;
-  final String? deviceId;
-  final String? deviceName;
 }

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 enum DevicePlatform {
   android('android'),
   windows('windows'),
@@ -6,6 +8,19 @@ enum DevicePlatform {
   const DevicePlatform(this.wireName);
 
   final String wireName;
+
+  static DevicePlatform get current {
+    if (Platform.isAndroid) return DevicePlatform.android;
+    if (Platform.isWindows) return DevicePlatform.windows;
+    return DevicePlatform.macos;
+  }
+
+  static DevicePlatform fromWireName(Object? value) {
+    return DevicePlatform.values.firstWhere(
+      (platform) => platform.wireName == value,
+      orElse: () => DevicePlatform.macos,
+    );
+  }
 }
 
 class TrustedDevice {
@@ -13,28 +28,20 @@ class TrustedDevice {
     required this.id,
     required this.name,
     required this.platform,
-    required this.trustedAt,
-    required this.lastSeenAt,
-    required this.autoAcceptTransfers,
   });
 
   final String id;
   final String name;
   final DevicePlatform platform;
-  final DateTime trustedAt;
-  final DateTime lastSeenAt;
-  final bool autoAcceptTransfers;
-
-  bool get canAutoAccept => autoAcceptTransfers;
-
   Map<String, Object?> toJson() {
-    return {
-      'id': id,
-      'name': name,
-      'platform': platform.wireName,
-      'trustedAt': trustedAt.toUtc().toIso8601String(),
-      'lastSeenAt': lastSeenAt.toUtc().toIso8601String(),
-      'autoAcceptTransfers': autoAcceptTransfers,
-    };
+    return {'id': id, 'name': name, 'platform': platform.wireName};
+  }
+
+  factory TrustedDevice.fromJson(Map<String, Object?> json) {
+    return TrustedDevice(
+      id: json['id'] as String,
+      name: json['name'] as String,
+      platform: DevicePlatform.fromWireName(json['platform']),
+    );
   }
 }

@@ -7,25 +7,20 @@ const _channel = MethodChannel('com.localmesh/filepicker');
 /// Pick a single file using the platform's native file picker.
 /// Returns the file path, name, and size, or null if cancelled.
 Future<({String path, String name, int size})?> pickFile() async {
-  try {
-    final result = await _channel.invokeMethod<String>('pickFile');
-    if (result == null || result.isEmpty) return null;
-
-    final parts = result.split('|');
-    if (parts.length < 3) return null;
-
-    final path = parts[0];
-    final rawName = parts[1];
-    // Strip any path-like segments to get just the basename
-    final name = rawName.contains('/') ? rawName.split('/').last : rawName.contains('\\') ? rawName.split('\\').last : rawName;
-    final size = int.tryParse(parts[2]) ?? 0;
-    if (path.isEmpty) return null;
-
-    return (path: path, name: name, size: size);
-  } catch (_) {
-    // Fallback: try using dart:io directly (desktop)
-    return _fallbackPickFile();
+  final result = await _channel.invokeMapMethod<String, Object?>('pickFile');
+  if (result == null) return null;
+  final path = result['path'];
+  final name = result['name'];
+  final size = result['size'];
+  if (path is! String ||
+      path.isEmpty ||
+      name is! String ||
+      name.isEmpty ||
+      size is! int ||
+      size < 0) {
+    throw const FormatException('Platform returned an invalid file.');
   }
+  return (path: path, name: name, size: size);
 }
 
 /// Get the download/received directory path from the platform.
@@ -49,10 +44,10 @@ Future<String> getDownloadDir() async {
 /// via MediaStore API. Returns the content:// URI on success, or null on failure.
 Future<String?> moveToDownloads(String tempPath, String fileName) async {
   try {
-    final uri = await _channel.invokeMethod<String>(
-      'moveToDownloads',
-      {'tempPath': tempPath, 'fileName': fileName},
-    );
+    final uri = await _channel.invokeMethod<String>('moveToDownloads', {
+      'tempPath': tempPath,
+      'fileName': fileName,
+    });
     return uri;
   } catch (e) {
     return null;
@@ -80,21 +75,32 @@ Future<bool> openLocalFile(String path) async {
   }
 }
 
-/// Fallback file picker using stdin (for debug/test environments).
-Future<({String path, String name, int size})?> _fallbackPickFile() async {
-  // On desktop platforms, try reading from a hardcoded test path
-  if (Platform.isMacOS || Platform.isLinux) {
-    final home = Platform.environment['HOME'] ?? '';
-    // List some files from Desktop as potential picks
-    final desktop = Directory('$home/Desktop');
-    if (await desktop.exists()) {
-      final files = await desktop.list().where((e) => e is File).cast<File>().take(5).toList();
-        if (files.isNotEmpty) {
-          final f = files.first;
-          final stat = await f.stat();
-          return (path: f.path, name: f.uri.pathSegments.last, size: stat.size as int);
-      }
-    }
+/// Open an HTTPS URL in the platform's default browser.
+Future<bool> openExternalUrl(String url) async {
+  final uri = Uri.tryParse(url);
+  if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) return false;
+  try {
+    return await _channel.invokeMethod<bool>('openExternalUrl', {'url': url}) ??
+        false;
+  } catch (_) {
+    return false;
   }
-  return null;
+}
+
+/// Delete a received file. Android uses its MediaStore URI; desktop platforms
+/// delete the local path directly.
+Future<bool> deleteReceivedFile({String? uri, String? path}) async {
+  try {
+    if (uri != null) {
+      return await _channel.invokeMethod<bool>('deleteFile', {'uri': uri}) ??
+          false;
+    }
+    if (path != null) {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
 }

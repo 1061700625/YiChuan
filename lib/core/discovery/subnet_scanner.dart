@@ -37,7 +37,9 @@ class SubnetScanner {
 
       // Process in batches to avoid too many concurrent connections
       for (var i = 0; i < ips.length; i += maxConcurrent) {
-        final end = (i + maxConcurrent < ips.length) ? i + maxConcurrent : ips.length;
+        final end = (i + maxConcurrent < ips.length)
+            ? i + maxConcurrent
+            : ips.length;
         final batch = ips.sublist(i, end);
         final batchResults = await Future.wait(
           batch.map((ip) => _tryConnect(ip, scanPort)),
@@ -59,9 +61,12 @@ class SubnetScanner {
     final parts = ownIp.split('.');
     if (parts.length != 4) {
       candidates.addAll([
-        '192.168.1.1', '192.168.1.100',
-        '192.168.0.1', '192.168.0.100',
-        '10.0.0.1', '10.0.0.100',
+        '192.168.1.1',
+        '192.168.1.100',
+        '192.168.0.1',
+        '192.168.0.100',
+        '10.0.0.1',
+        '10.0.0.100',
         '172.16.0.1',
       ]);
       return candidates.toList();

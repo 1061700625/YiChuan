@@ -108,7 +108,11 @@ class DiscoveryService {
     final existing = _devices[normalizedIp]?.info;
     final info = DiscoveredServiceInfo(
       deviceId: _preferDeviceId(deviceId, existing?.deviceId),
-      deviceName: _preferDeviceName(deviceName, existing?.deviceName, normalizedIp),
+      deviceName: _preferDeviceName(
+        deviceName,
+        existing?.deviceName,
+        normalizedIp,
+      ),
       platform: platform,
       ip: normalizedIp,
       port: port > 0 ? port : (existing?.port ?? port),
@@ -130,7 +134,9 @@ class DiscoveryService {
   }
 
   String _preferDeviceId(String incoming, String? existing) {
-    if (existing == null || existing.startsWith('scanned-') || existing.startsWith('manual-')) {
+    if (existing == null ||
+        existing.startsWith('scanned-') ||
+        existing.startsWith('manual-')) {
       return incoming;
     }
     if (incoming.startsWith('scanned-') || incoming.startsWith('manual-')) {
@@ -144,7 +150,8 @@ class DiscoveryService {
     final cleanExisting = existing?.trim();
 
     if (_isUsefulDeviceName(cleanIncoming, ip)) return cleanIncoming;
-    if (cleanExisting != null && _isUsefulDeviceName(cleanExisting, ip)) return cleanExisting;
+    if (cleanExisting != null && _isUsefulDeviceName(cleanExisting, ip))
+      return cleanExisting;
     if (cleanIncoming.isNotEmpty) return cleanIncoming;
     return cleanExisting?.isNotEmpty == true ? cleanExisting! : '未知设备 ($ip)';
   }
