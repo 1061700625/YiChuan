@@ -176,7 +176,8 @@ class WebSocketNetworkService implements NetworkService {
   @override
   Future<void> disconnect(String clientId) async {
     final client = _clients.remove(clientId);
-    await client?.close();
+    if (client == null) return;
+    await client.close();
     _onClientDisconnected?.call(clientId);
     if (_clients.isEmpty) {
       _state = _server != null
@@ -187,7 +188,7 @@ class WebSocketNetworkService implements NetworkService {
 
   @override
   Future<void> stopServer() async {
-    for (final client in _clients.values) {
+    for (final client in List<WebSocket>.of(_clients.values)) {
       await client.close();
     }
     _clients.clear();

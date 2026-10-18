@@ -167,6 +167,7 @@ class MainActivity : FlutterActivity() {
                         result.error("FILE_PICKER_ERROR", e.message, null)
                     }
                 }
+                "getStateDir" -> result.success(filesDir.absolutePath)
                 "getDownloadDir" -> {
                     // Use app's private filesDir for temporary storage
                     val received = File(filesDir, "received")

@@ -40,6 +40,22 @@ Future<String> getDownloadDir() async {
   return receivedDir.path;
 }
 
+/// Keep authentication credentials outside the received-files directory.
+Future<String> getStateDir() async {
+  if (Platform.isAndroid) {
+    final path = await _channel.invokeMethod<String>('getStateDir');
+    if (path == null || path.isEmpty) throw StateError('无法获取应用数据目录');
+    return path;
+  }
+  final home = Platform.environment['HOME'] ?? Directory.current.path;
+  final base = Platform.isWindows
+      ? Platform.environment['LOCALAPPDATA'] ?? home
+      : '$home/Library/Application Support';
+  final directory = Directory('$base/YiChuan');
+  await directory.create(recursive: true);
+  return directory.path;
+}
+
 /// Move a completed file from temp storage to the public Downloads folder
 /// via MediaStore API. Returns the content:// URI on success, or null on failure.
 Future<String?> moveToDownloads(String tempPath, String fileName) async {

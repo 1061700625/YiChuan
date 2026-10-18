@@ -17,6 +17,8 @@ class PairingPage extends StatefulWidget {
     required this.networkService,
     required this.localDeviceId,
     this.statusMessage = '',
+    this.onRequestTrust,
+    this.trustPending = false,
     super.key,
   });
 
@@ -25,6 +27,8 @@ class PairingPage extends StatefulWidget {
   final NetworkService networkService;
   final String localDeviceId;
   final String statusMessage;
+  final Future<void> Function()? onRequestTrust;
+  final bool trustPending;
 
   @override
   State<PairingPage> createState() => _PairingPageState();
@@ -32,6 +36,8 @@ class PairingPage extends StatefulWidget {
 
 class _PairingPageState extends State<PairingPage> {
   String _pairingCode = '';
+  Timer? _codeTimer;
+  bool _connecting = false;
   final _inputController = TextEditingController();
   bool _scanningNetwork = false;
   String _ownIp = '';
@@ -42,6 +48,16 @@ class _PairingPageState extends State<PairingPage> {
   void initState() {
     super.initState();
     _pairingCode = widget.sessionService.generatePairingCode();
+
+    _codeTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (widget.sessionService.state == SessionState.paired) return;
+      final code = widget.sessionService.generatePairingCode();
+      if (code != _pairingCode && mounted) {
+        setState(() => _pairingCode = code);
+      }
+    });
+
+    widget.sessionService.addListener(_onSessionChanged);
 
     // Listen for new discovered devices → refresh UI
     widget.discoveryService.addListener(_onDeviceDiscovered);
@@ -59,9 +75,15 @@ class _PairingPageState extends State<PairingPage> {
 
   @override
   void dispose() {
+    widget.sessionService.removeListener(_onSessionChanged);
+    _codeTimer?.cancel();
     widget.discoveryService.removeListener(_onDeviceDiscovered);
     _inputController.dispose();
     super.dispose();
+  }
+
+  void _onSessionChanged() {
+    if (mounted) setState(() {});
   }
 
   void _onDeviceDiscovered(DiscoveredServiceInfo _) {
@@ -99,6 +121,17 @@ class _PairingPageState extends State<PairingPage> {
           Icon(Icons.check_circle, size: 64, color: scheme.primary),
           const SizedBox(height: 16),
           Text('已连接', style: Theme.of(context).textTheme.headlineMedium),
+          const SizedBox(height: 12),
+          if (widget.statusMessage.isNotEmpty &&
+              widget.statusMessage != '已互相信任')
+            Text(widget.statusMessage),
+          if (widget.sessionService.isPeerTrusted) const Text('已互相信任'),
+          if (widget.onRequestTrust != null &&
+              !widget.sessionService.isPeerTrusted)
+            FilledButton.tonal(
+              onPressed: widget.trustPending ? null : widget.onRequestTrust,
+              child: Text(widget.trustPending ? '等待对方确认信任…' : '申请互相信任'),
+            ),
           const SizedBox(height: 32),
           FilledButton.tonal(
             onPressed: () async {
@@ -109,6 +142,7 @@ class _PairingPageState extends State<PairingPage> {
               if (mounted) {
                 setState(() {
                   widget.sessionService.disconnect();
+                  _pairingCode = widget.sessionService.generatePairingCode();
                 });
               }
             },
@@ -165,7 +199,7 @@ class _PairingPageState extends State<PairingPage> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  '在手机上输入此 6 位验证码',
+                  '在手机上输入此 6 位验证码（5 分钟内有效，过期自动刷新）',
                   style: Theme.of(context).textTheme.bodyMedium,
                 ),
                 const SizedBox(height: 16),
@@ -220,9 +254,18 @@ class _PairingPageState extends State<PairingPage> {
             ),
             title: Text(device.deviceName),
             subtitle: Text('${device.ip}:${device.port}'),
-            trailing: FilledButton(
-              onPressed: () => _showPairDialog(device),
-              child: const Text('连接'),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextButton(
+                  onPressed: _connecting ? null : () => _showPairDialog(device),
+                  child: const Text('配对码'),
+                ),
+                FilledButton(
+                  onPressed: _connecting ? null : () => _connectOrPair(device),
+                  child: const Text('连接'),
+                ),
+              ],
             ),
           ),
         );
@@ -314,6 +357,24 @@ class _PairingPageState extends State<PairingPage> {
     }
   }
 
+  Future<void> _connectOrPair(DiscoveredServiceInfo device) async {
+    final trusted = await widget.sessionService.trustedDevice(device.deviceId);
+    if (!mounted || _connecting) return;
+    if (trusted?.canReconnect == true) {
+      await _connectToDevice(
+        host: device.ip,
+        port: device.port,
+        peerDeviceId: device.deviceId,
+        peerDeviceName: device.deviceName,
+        peerPlatform: device.platform,
+        pairingCode: '',
+        trustSecret: trusted!.trustSecret,
+      );
+    } else {
+      _showPairDialog(device);
+    }
+  }
+
   void _showPairDialog(DiscoveredServiceInfo device) {
     _inputController.clear();
     showDialog(
@@ -360,8 +421,11 @@ class _PairingPageState extends State<PairingPage> {
     required String peerDeviceName,
     required DevicePlatform peerPlatform,
     required String pairingCode,
+    String? trustSecret,
   }) async {
-    if (pairingCode.length != 6) {
+    if (_connecting || widget.sessionService.state == SessionState.paired)
+      return;
+    if (trustSecret == null && pairingCode.length != 6) {
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -378,6 +442,10 @@ class _PairingPageState extends State<PairingPage> {
       return;
     }
 
+    setState(() => _connecting = true);
+    String? pendingClientId;
+    var paired = false;
+    MessageReceivedCallback? pairingCallback;
     MessageReceivedCallback? originalCallback;
     var callbackInstalled = false;
     try {
@@ -385,6 +453,7 @@ class _PairingPageState extends State<PairingPage> {
         host: host,
         port: port,
       );
+      pendingClientId = clientId;
       if (clientId == null) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -396,7 +465,10 @@ class _PairingPageState extends State<PairingPage> {
         return;
       }
 
+      if (!mounted) return;
       final localDeviceName = await getLocalDeviceName();
+      var challenge = '';
+      final challengeCompleter = Completer<String>();
       final request = ProtocolMessage(
         type: ProtocolMessageType.pairRequest,
         version: 1,
@@ -413,32 +485,90 @@ class _PairingPageState extends State<PairingPage> {
       final completer = Completer<PairResult>();
       originalCallback = widget.networkService.onMessageReceived;
 
-      widget.networkService.onMessageReceived = (sourceClientId, message) {
+      pairingCallback = (sourceClientId, message) {
         if (sourceClientId == clientId &&
+            message.version == 1 &&
             message.type == ProtocolMessageType.pairResult &&
             !completer.isCompleted) {
-          final success = message.payload['success'] == true;
+          final serverProof = message.payload['serverProof'];
+          final verified =
+              trustSecret == null ||
+              (challenge.isNotEmpty &&
+                  message.sessionId != null &&
+                  serverProof ==
+                      SessionService.trustProof(
+                        trustSecret,
+                        '$challenge:${message.sessionId}',
+                        peerDeviceId,
+                      ));
+          final success = message.payload['success'] == true && verified;
           completer.complete(
             PairResult(
               success: success,
               sessionId: message.sessionId,
               error: success
                   ? null
-                  : (message.payload['error'] as String? ?? '配对失败'),
+                  : (message.payload['error'] as String? ??
+                        '信任验证失败，请使用配对码重新连接'),
             ),
           );
         }
+        if (sourceClientId == clientId &&
+            message.version == 1 &&
+            message.type == ProtocolMessageType.trustedChallenge &&
+            message.payload['challenge'] is String &&
+            !challengeCompleter.isCompleted) {
+          challengeCompleter.complete(message.payload['challenge'] as String);
+        }
         return originalCallback?.call(sourceClientId, message);
       };
+      widget.networkService.onMessageReceived = pairingCallback;
       callbackInstalled = true;
 
-      await widget.networkService.send(clientId, request);
+      var outgoingRequest = request;
+      if (trustSecret != null) {
+        if (!await widget.networkService.send(
+          clientId,
+          ProtocolMessage(
+            type: ProtocolMessageType.trustedChallengeRequest,
+            version: 1,
+            messageId: 'challenge_${request.messageId}',
+            timestamp: DateTime.now(),
+            payload: {},
+          ),
+        ))
+          throw StateError('连接已断开');
+        challenge = await challengeCompleter.future.timeout(
+          const Duration(seconds: 5),
+        );
+        final payload = Map<String, Object?>.from(request.payload)
+          ..remove('pairingCode')
+          ..addAll({
+            'challenge': challenge,
+            'proof': SessionService.trustProof(
+              trustSecret,
+              challenge,
+              widget.localDeviceId,
+            ),
+          });
+        outgoingRequest = ProtocolMessage(
+          type: request.type,
+          version: 1,
+          messageId: request.messageId,
+          timestamp: request.timestamp,
+          payload: payload,
+        );
+      }
+      if (!await widget.networkService.send(clientId, outgoingRequest)) {
+        throw StateError('连接已断开');
+      }
 
       final result = await completer.future.timeout(
         const Duration(seconds: 10),
         onTimeout: () => const PairResult(success: false, error: '连接超时'),
       );
 
+      if (!mounted) return;
       if (result.success) {
         await widget.sessionService.acceptPairResult(
           clientId: clientId,
@@ -447,6 +577,7 @@ class _PairingPageState extends State<PairingPage> {
           peerDeviceName: peerDeviceName,
           peerPlatform: peerPlatform,
         );
+        paired = true;
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -468,8 +599,16 @@ class _PairingPageState extends State<PairingPage> {
         ).showSnackBar(SnackBar(content: Text('连接出错: $e')));
       }
     } finally {
-      if (callbackInstalled) {
+      if (callbackInstalled &&
+          identical(widget.networkService.onMessageReceived, pairingCallback)) {
         widget.networkService.onMessageReceived = originalCallback;
+      }
+      try {
+        if (!paired && pendingClientId != null) {
+          await widget.networkService.disconnect(pendingClientId);
+        }
+      } finally {
+        if (mounted) setState(() => _connecting = false);
       }
     }
   }

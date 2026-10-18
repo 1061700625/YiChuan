@@ -29,7 +29,7 @@
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Local Mesh Transfer 需要在局域网中发现设备以进行文件传输。</string>
+	<string>驿传需要在局域网中发现设备以进行文件传输。</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_localmesh._tcp</string>

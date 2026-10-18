@@ -93,7 +93,9 @@ class _SettingsPageState extends State<SettingsPage> {
                     color: scheme.primary,
                   ),
                   title: Text(device.name),
-                  subtitle: const Text('已信任'),
+                  subtitle: Text(
+                    device.canReconnect ? '已信任 · 连接时无需配对码' : '历史配对设备 · 需重新申请信任',
+                  ),
                   trailing: IconButton(
                     icon: Icon(Icons.delete_outline, color: scheme.error),
                     onPressed: () async {
@@ -120,7 +122,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            '驿传 v1.0.1',
+                            '驿传 v1.0.3',
                             style: textTheme.titleSmall?.copyWith(
                               fontWeight: FontWeight.w600,
                             ),

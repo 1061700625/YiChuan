@@ -9,10 +9,11 @@ import 'package:flutter/material.dart';
 import '../core/discovery/subnet_scanner.dart';
 import '../core/discovery/udp_discovery_service.dart';
 import '../core/network/websocket_network_service.dart';
+import '../core/network/network_service.dart';
 import '../core/platform/android_permissions.dart';
 import '../core/platform/device_identity.dart';
 import '../core/platform/file_picker_channel.dart'
-    show getDownloadDir, moveToDownloads;
+    show getDownloadDir, getStateDir, moveToDownloads;
 import '../core/platform/network_info.dart';
 import '../core/protocol/binary_transfer_chunk.dart';
 import '../core/protocol/protocol_message.dart';
@@ -27,7 +28,16 @@ import '../features/transfers/transfer_list_page.dart';
 import 'theme/app_theme.dart';
 
 class LocalMeshTransferApp extends StatefulWidget {
-  const LocalMeshTransferApp({super.key});
+  const LocalMeshTransferApp({
+    this.networkService,
+    this.discoveryService,
+    this.dataDirectory,
+    super.key,
+  });
+
+  final NetworkService? networkService;
+  final UdpDiscoveryService? discoveryService;
+  final Directory? dataDirectory;
 
   @override
   State<LocalMeshTransferApp> createState() => _LocalMeshTransferAppState();
@@ -36,11 +46,16 @@ class LocalMeshTransferApp extends StatefulWidget {
 class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     with WidgetsBindingObserver {
   int _currentTab = 0;
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  ({String id, String client, String session, String secret})? _pendingTrust;
+  Timer? _trustTimer;
+  Timer? _subnetScanTimer;
+  bool _trustDialogOpen = false;
 
   late final DeviceRepository _deviceRepo;
   late final SessionService _sessionService;
   late final UdpDiscoveryService _discoveryService;
-  late final WebSocketNetworkService _networkService;
+  late final NetworkService _networkService;
   late final TransferQueueService _transferQueue;
   final _incomingFiles = <String, _IncomingFile>{};
 
@@ -55,18 +70,37 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     WidgetsBinding.instance.addObserver(this);
     _deviceRepo = DeviceRepository();
     _sessionService = SessionService(deviceRepo: _deviceRepo);
-    _discoveryService = UdpDiscoveryService();
-    _networkService = WebSocketNetworkService();
+    _sessionService.addListener(_onSessionChanged);
+    _discoveryService = widget.discoveryService ?? UdpDiscoveryService();
+    _networkService = widget.networkService ?? WebSocketNetworkService();
     _transferQueue = TransferQueueService();
     unawaited(_initializeServices());
   }
 
+  void _onSessionChanged() {
+    if (!mounted) return;
+    setState(() {
+      if (_sessionService.state == SessionState.paired &&
+          _statusMessage == '对方已断开连接') {
+        _statusMessage = '已连接';
+      }
+    });
+  }
+
   Future<void> _initializeServices() async {
     try {
-      final downloadDir = await getDownloadDir();
-      await _deviceRepo.initialize(
-        File('$downloadDir${Platform.pathSeparator}.yichuan_state.json'),
+      final downloadDir = widget.dataDirectory?.path ?? await getDownloadDir();
+      final stateDir = widget.dataDirectory?.path ?? await getStateDir();
+      final stateFile = File(
+        '$stateDir${Platform.pathSeparator}.yichuan_state.json',
       );
+      final legacyFile = File(
+        '$downloadDir${Platform.pathSeparator}.yichuan_state.json',
+      );
+      if (!await stateFile.exists() && await legacyFile.exists()) {
+        await legacyFile.copy(stateFile.path);
+      }
+      await _deviceRepo.initialize(stateFile);
       _localDeviceId = await _deviceRepo.getOrCreateLocalDeviceId();
       final deviceName = await getLocalDeviceName();
 
@@ -122,6 +156,10 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
       _networkService.onClientDisconnected = (clientId) {
         final wasPaired = _sessionService.pairedClientId == clientId;
         _sessionService.disconnectClient(clientId);
+        if (_pendingTrust?.client == clientId) {
+          _trustTimer?.cancel();
+          _pendingTrust = null;
+        }
         unawaited(_suspendIncomingForClient(clientId));
         if (!wasPaired) return;
         unawaited(_stopBackgroundConnectionService());
@@ -139,7 +177,9 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
       _networkService.onMessageReceived = (clientId, message) =>
           _handleMessage(clientId, message, downloadDir);
 
-      unawaited(_autoSubnetScan());
+      _subnetScanTimer = Timer(const Duration(seconds: 5), () {
+        if (mounted) unawaited(_autoSubnetScan());
+      });
       if (mounted) {
         setState(() => _statusMessage = '服务已启动 (端口 $wsPort)');
       }
@@ -178,6 +218,108 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     await stopConnectionForegroundService();
   }
 
+  Future<void> _requestTrust() async {
+    final client = _sessionService.pairedClientId;
+    final session = _sessionService.currentSessionId;
+    if (client == null ||
+        session == null ||
+        _pendingTrust != null ||
+        _sessionService.isPeerTrusted)
+      return;
+    final request = (
+      id: 'trust_${DateTime.now().microsecondsSinceEpoch}',
+      client: client,
+      session: session,
+      secret: _sessionService.newTrustSecret(),
+    );
+    setState(() => _pendingTrust = request);
+    _trustTimer = Timer(const Duration(seconds: 30), () {
+      if (mounted)
+        setState(() {
+          _pendingTrust = null;
+          _statusMessage = '信任申请超时，请重试';
+        });
+    });
+    if (!await _networkService.send(
+      client,
+      ProtocolMessage(
+        type: ProtocolMessageType.trustRequest,
+        version: 1,
+        messageId: request.id,
+        sessionId: session,
+        timestamp: DateTime.now(),
+        payload: {'secret': request.secret},
+      ),
+    )) {
+      _trustTimer?.cancel();
+      if (mounted) setState(() => _pendingTrust = null);
+    }
+  }
+
+  Future<void> _handleTrustRequest(
+    String clientId,
+    ProtocolMessage message,
+  ) async {
+    if (!_sessionService.authorizes(clientId, message.sessionId)) return;
+    final secret = message.payload['secret'];
+    if (secret is! String || !RegExp(r'^[0-9a-f]{64}$').hasMatch(secret))
+      return;
+    var accepted = false;
+    final context = _navigatorKey.currentContext;
+    if (!_trustDialogOpen && _pendingTrust == null && context != null) {
+      _trustDialogOpen = true;
+      try {
+        accepted =
+            await showDialog<bool>(
+              context: context,
+              builder: (context) => AlertDialog(
+                title: const Text('信任设备申请'),
+                content: Text(
+                  '${_sessionService.peer?.name ?? "对方"} 申请互相信任。\n同意后，此设备可免配对码连接。',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('拒绝'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('同意并信任'),
+                  ),
+                ],
+              ),
+            ).timeout(
+              const Duration(seconds: 25),
+              onTimeout: () {
+                if (mounted && _navigatorKey.currentState != null) {
+                  _navigatorKey.currentState!.pop(false);
+                }
+                return false;
+              },
+            ) ??
+            false;
+      } finally {
+        _trustDialogOpen = false;
+      }
+    }
+    if (!_sessionService.authorizes(clientId, message.sessionId)) return;
+    if (accepted)
+      await _sessionService.trustPeer(clientId, message.sessionId!, secret);
+    await _networkService.send(
+      clientId,
+      ProtocolMessage(
+        type: ProtocolMessageType.trustResult,
+        version: 1,
+        messageId: 'resp_${message.messageId}',
+        sessionId: message.sessionId,
+        timestamp: DateTime.now(),
+        payload: {'accepted': accepted, 'requestId': message.messageId},
+      ),
+    );
+    if (mounted)
+      setState(() => _statusMessage = accepted ? '已互相信任' : '已拒绝信任申请');
+  }
+
   Future<void> _handleMessage(
     String clientId,
     ProtocolMessage message,
@@ -198,14 +340,76 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
             port: (message.payload['port'] as num?)?.toInt() ?? 45678,
           );
 
-        case ProtocolMessageType.pairRequest:
-          final result = await _sessionService.handlePairRequest(
-            clientId: clientId,
-            deviceId: message.payload['deviceId'] as String,
-            deviceName: message.payload['deviceName'] as String,
-            platform: DevicePlatform.fromWireName(message.payload['platform']),
-            pairingCode: message.payload['pairingCode'] as String,
+        case ProtocolMessageType.trustedChallengeRequest:
+          await _networkService.send(
+            clientId,
+            ProtocolMessage(
+              type: ProtocolMessageType.trustedChallenge,
+              version: 1,
+              messageId: 'resp_${message.messageId}',
+              timestamp: DateTime.now(),
+              payload: {
+                'challenge': _sessionService.createTrustChallenge(clientId),
+              },
+            ),
           );
+
+        case ProtocolMessageType.trustedChallenge:
+          break;
+
+        case ProtocolMessageType.trustRequest:
+          // User confirmation must not pause socket reads (including pongs).
+          // File offer/chunk handlers remain awaited to preserve write ordering.
+          unawaited(
+            _handleTrustRequest(clientId, message).catchError((Object error) {
+              if (mounted) setState(() => _statusMessage = '信任申请失败: $error');
+            }),
+          );
+
+        case ProtocolMessageType.trustResult:
+          final pending = _pendingTrust;
+          if (pending == null ||
+              pending.client != clientId ||
+              pending.session != message.sessionId ||
+              message.payload['requestId'] != pending.id ||
+              !_sessionService.authorizes(clientId, message.sessionId))
+            return;
+          _trustTimer?.cancel();
+          try {
+            if (message.payload['accepted'] == true) {
+              await _sessionService.trustPeer(
+                clientId,
+                pending.session,
+                pending.secret,
+              );
+            }
+            if (mounted)
+              setState(() {
+                _statusMessage = message.payload['accepted'] == true
+                    ? '已互相信任'
+                    : '对方拒绝了信任申请';
+              });
+          } finally {
+            if (mounted) setState(() => _pendingTrust = null);
+          }
+
+        case ProtocolMessageType.pairRequest:
+          final proof = message.payload['proof'] as String?;
+          final result = proof != null
+              ? await _sessionService.handleTrustedPairRequest(
+                  clientId: clientId,
+                  deviceId: message.payload['deviceId'] as String,
+                  proof: proof,
+                )
+              : await _sessionService.handlePairRequest(
+                  clientId: clientId,
+                  deviceId: message.payload['deviceId'] as String,
+                  deviceName: message.payload['deviceName'] as String,
+                  platform: DevicePlatform.fromWireName(
+                    message.payload['platform'],
+                  ),
+                  pairingCode: message.payload['pairingCode'] as String,
+                );
           await _networkService.send(
             clientId,
             ProtocolMessage(
@@ -216,6 +420,12 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
               timestamp: DateTime.now(),
               payload: {
                 'success': result.success,
+                if (result.success && proof != null)
+                  'serverProof': SessionService.trustProof(
+                    _sessionService.peer!.trustSecret!,
+                    '${message.payload['challenge']}:${result.sessionId}',
+                    _localDeviceId,
+                  ),
                 if (result.error != null) 'error': result.error,
               },
             ),
@@ -229,7 +439,10 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
           }
           if (mounted) {
             setState(() {
-              if (result.success) _currentTab = 1;
+              if (result.success) {
+                _currentTab = 1;
+                _statusMessage = '已连接';
+              }
             });
           }
 
@@ -626,7 +839,6 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
   }
 
   Future<void> _autoSubnetScan() async {
-    await Future<void>.delayed(const Duration(seconds: 5));
     final ownIp = await NetworkInfo.getLocalIp();
     if (ownIp == null ||
         !mounted ||
@@ -648,6 +860,8 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
 
   @override
   void dispose() {
+    _subnetScanTimer?.cancel();
+    _trustTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_stopBackgroundConnectionService());
     for (final incoming in _incomingFiles.values) {
@@ -659,7 +873,9 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
       } catch (_) {}
     }
     _incomingFiles.clear();
-    _networkService.dispose();
+    unawaited(_networkService.stopServer());
+    _sessionService.removeListener(_onSessionChanged);
+    _sessionService.dispose();
     _discoveryService.dispose();
     unawaited(releaseMulticastLock());
     super.dispose();
@@ -669,6 +885,7 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      navigatorKey: _navigatorKey,
       title: '驿传',
       themeMode: ThemeMode.system,
       theme: AppTheme.light(),
@@ -683,6 +900,8 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
               networkService: _networkService,
               localDeviceId: _localDeviceId,
               statusMessage: _statusMessage,
+              onRequestTrust: _requestTrust,
+              trustPending: _pendingTrust != null,
             ),
             TransferListPage(
               transferQueue: _transferQueue,

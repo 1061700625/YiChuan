@@ -41,10 +41,12 @@ class _TransferListPageState extends State<TransferListPage> {
   void initState() {
     super.initState();
     widget.transferQueue.addListener(_onTaskChanged);
+    widget.sessionService.addListener(_onSessionChanged);
   }
 
   @override
   void dispose() {
+    widget.sessionService.removeListener(_onSessionChanged);
     widget.transferQueue.removeListener(_onTaskChanged);
     for (final waiter in _progressWaiters.values) {
       if (!waiter.completer.isCompleted) {
@@ -62,6 +64,23 @@ class _TransferListPageState extends State<TransferListPage> {
     _resumeWaiters.clear();
     super.dispose();
   }
+
+  void _onSessionChanged() {
+    if (mounted) setState(() {});
+  }
+
+  bool get _canSend =>
+      widget.sessionService.state == SessionState.paired &&
+      widget.networkService.connectedClients.contains(
+        widget.sessionService.pairedClientId,
+      );
+
+  bool get _sendingFile => _tasks.any(
+    (task) =>
+        !widget.transferQueue.isReceived(task.id) &&
+        task.kind == TransferTaskKind.file &&
+        task.status == TransferTaskStatus.transferring,
+  );
 
   void _onTaskChanged(TransferTask task) {
     final resumeWaiter = _resumeWaiters[task.id];
@@ -93,12 +112,7 @@ class _TransferListPageState extends State<TransferListPage> {
 
   List<TransferTask> get _tasks => widget.transferQueue.tasks;
 
-  String get _connectionStatus {
-    final count = widget.networkService.connectedClients.length;
-    if (count == 0) return '未连接';
-    if (count == 1) return '已连接 1 台设备';
-    return '已连接 $count 台设备';
-  }
+  String get _connectionStatus => _canSend ? '已连接 1 台设备' : '未连接';
 
   Future<void> _pickAndSendFile() async {
     if (_picking) return;
@@ -125,7 +139,7 @@ class _TransferListPageState extends State<TransferListPage> {
       final fileHash = (await sha256.bind(file.openRead()).first).toString();
       final resumeToken = _newResumeToken();
 
-      final taskId = 'send_${DateTime.now().millisecondsSinceEpoch}';
+      final taskId = 'send_${_newResumeToken()}';
       widget.transferQueue.addOffer(
         taskId: taskId,
         fileName: fileName,
@@ -220,7 +234,7 @@ class _TransferListPageState extends State<TransferListPage> {
       ).showSnackBar(const SnackBar(content: Text('连接已断开，请重新配对')));
       return;
     }
-    final taskId = 'text_${DateTime.now().microsecondsSinceEpoch}';
+    final taskId = 'text_${_newResumeToken()}';
     final sent = await widget.networkService.send(
       clientId,
       ProtocolMessage(
@@ -694,7 +708,7 @@ class _TransferListPageState extends State<TransferListPage> {
                   height: 8,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: widget.networkService.connectedClients.isNotEmpty
+                    color: _canSend
                         ? const Color(0xFF4CAF50) // green dot
                         : scheme.outline,
                   ),
@@ -709,10 +723,7 @@ class _TransferListPageState extends State<TransferListPage> {
           ),
         ),
       ),
-      floatingActionButton:
-          (_tasks.any((t) => t.status == TransferTaskStatus.transferring) ||
-              !widget.networkService.isInitiator ||
-              widget.sessionService.state != SessionState.paired)
+      floatingActionButton: !_canSend
           ? null
           : Column(
               mainAxisSize: MainAxisSize.min,
@@ -727,7 +738,7 @@ class _TransferListPageState extends State<TransferListPage> {
                 const SizedBox(height: 12),
                 FloatingActionButton.extended(
                   heroTag: 'send-file',
-                  onPressed: _picking ? null : _pickAndSendFile,
+                  onPressed: _picking || _sendingFile ? null : _pickAndSendFile,
                   icon: _picking
                       ? const SizedBox(
                           width: 16,
@@ -759,11 +770,7 @@ class _TransferListPageState extends State<TransferListPage> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    widget.networkService.connectedClients.isEmpty
-                        ? '请先在"配对"页面连接设备'
-                        : widget.networkService.isInitiator
-                        ? '配对完成后，发送文件或文字'
-                        : '等待对方发送内容…',
+                    !_canSend ? '请先在"配对"页面连接设备' : '双方均可发送文件或文字',
                     style: textTheme.bodySmall?.copyWith(color: scheme.outline),
                   ),
                 ],

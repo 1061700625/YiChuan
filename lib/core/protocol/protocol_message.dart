@@ -1,5 +1,9 @@
 enum ProtocolMessageType {
   hello('hello'),
+  trustedChallengeRequest('trusted_challenge_request'),
+  trustedChallenge('trusted_challenge'),
+  trustRequest('trust_request'),
+  trustResult('trust_result'),
   pairRequest('pair_request'),
   pairResult('pair_result'),
   transferOffer('transfer_offer'),
