@@ -122,7 +122,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            '驿传 v1.0.3',
+                            '驿传 v1.0.4',
                             style: textTheme.titleSmall?.copyWith(
                               fontWeight: FontWeight.w600,
                             ),

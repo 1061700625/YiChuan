@@ -149,6 +149,7 @@
 /Users/songxf/Desktop/YiChuan/lib/core/session/session_service.dart
 /Users/songxf/Desktop/YiChuan/lib/core/session/trusted_device.dart
 /Users/songxf/Desktop/YiChuan/lib/core/storage/device_repository.dart
+/Users/songxf/Desktop/YiChuan/lib/core/transfer/file_integrity.dart
 /Users/songxf/Desktop/YiChuan/lib/core/transfer/transfer_queue_service.dart
 /Users/songxf/Desktop/YiChuan/lib/core/transfer/transfer_task.dart
 /Users/songxf/Desktop/YiChuan/lib/features/pairing/pairing_page.dart

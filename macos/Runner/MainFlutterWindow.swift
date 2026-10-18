@@ -16,22 +16,30 @@ class MainFlutterWindow: NSWindow {
     )
     fileChannel.setMethodCallHandler { call, result in
       switch call.method {
-      case "pickFile":
+      case "pickFile", "pickFiles":
+        let multiple = call.method == "pickFiles"
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else {
-          result(nil)
+        panel.allowsMultipleSelection = multiple
+        guard panel.runModal() == .OK else {
+          result(multiple ? [] : nil)
           return
         }
         do {
-          let values = try url.resourceValues(forKeys: [.fileSizeKey, .nameKey])
-          result([
-            "path": url.path,
-            "name": values.name ?? url.lastPathComponent,
-            "size": values.fileSize ?? 0,
-          ])
+          let files: [[String: Any]] = try panel.urls.map { url in
+            let values = try url.resourceValues(forKeys: [.fileSizeKey, .nameKey])
+            return [
+              "path": url.path,
+              "name": values.name ?? url.lastPathComponent,
+              "size": values.fileSize ?? 0,
+            ]
+          }
+          if multiple {
+            result(files)
+          } else {
+            result(files.first)
+          }
         } catch {
           result(FlutterError(
             code: "FILE_INFO_ERROR",
@@ -68,6 +76,21 @@ class MainFlutterWindow: NSWindow {
           return
         }
         result(NSWorkspace.shared.open(URL(fileURLWithPath: path)))
+      case "revealFile":
+        guard
+          let arguments = call.arguments as? [String: Any],
+          let path = arguments["path"] as? String
+        else {
+          result(FlutterError(code: "INVALID_ARGS", message: "path required", details: nil))
+          return
+        }
+        let url = URL(fileURLWithPath: path)
+        if FileManager.default.fileExists(atPath: path) {
+          NSWorkspace.shared.activateFileViewerSelecting([url])
+          result(true)
+        } else {
+          result(NSWorkspace.shared.open(url.deletingLastPathComponent()))
+        }
       case "openExternalUrl":
         guard
           let arguments = call.arguments as? [String: Any],

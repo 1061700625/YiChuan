@@ -1,9 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:developer' as developer;
 import 'dart:typed_data';
 
-import 'package:crypto/crypto.dart';
+import '../core/transfer/file_integrity.dart';
 import 'package:flutter/material.dart';
 
 import '../core/discovery/subnet_scanner.dart';
@@ -164,7 +165,8 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
         if (!wasPaired) return;
         unawaited(_stopBackgroundConnectionService());
         for (final task in _transferQueue.tasks) {
-          if (task.status == TransferTaskStatus.transferring) {
+          if (task.status == TransferTaskStatus.transferring ||
+              task.status == TransferTaskStatus.verifying) {
             _transferQueue.pause(task.id);
           }
         }
@@ -490,7 +492,12 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
 
         case ProtocolMessageType.transferDone:
           if (_sessionService.authorizes(clientId, message.sessionId)) {
-            await _handleTransferDone(clientId, message);
+            // Hashing and saving must not hold up socket reads or reverse transfers.
+            unawaited(
+              _handleTransferDone(clientId, message).catchError((Object error) {
+                if (mounted) setState(() => _statusMessage = '文件校验失败: $error');
+              }),
+            );
           }
       }
     } catch (e) {
@@ -660,7 +667,10 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
           chunk.data.length > incoming.totalBytes - chunk.offset) {
         throw const FormatException('File chunk is out of sequence.');
       }
+      incoming.receiveTime.start();
+      incoming.writeTime.start();
       await raf.writeFrom(chunk.data);
+      incoming.writeTime.stop();
       incoming.receivedBytes += chunk.data.length;
       _transferQueue.recordProgress(
         chunk.taskId,
@@ -728,12 +738,16 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
           expectedSha256 != incoming.expectedSha256) {
         throw const FormatException('Missing or invalid SHA-256.');
       }
-      final digest = await sha256
-          .bind(File(incoming.savePath).openRead())
-          .first;
-      if (digest.toString() != expectedSha256) {
+      final digest = await computeFileSha256(incoming.savePath);
+      if (digest != expectedSha256) {
         throw const FormatException('SHA-256 mismatch.');
       }
+
+      incoming.receiveTime.stop();
+      developer.log(
+        'bytes=${incoming.receivedBytes} writeMs=${incoming.writeTime.elapsedMilliseconds} totalMs=${incoming.receiveTime.elapsedMilliseconds}',
+        name: 'yichuan.transfer.receive',
+      );
 
       final fileName = incoming.savePath.split(Platform.pathSeparator).last;
       if (Platform.isAndroid) {
@@ -950,4 +964,6 @@ class _IncomingFile {
   final String expectedSha256;
   final String resumeToken;
   int receivedBytes = 0;
+  final writeTime = Stopwatch();
+  final receiveTime = Stopwatch();
 }

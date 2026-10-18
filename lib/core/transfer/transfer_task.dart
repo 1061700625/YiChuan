@@ -2,7 +2,14 @@ import 'dart:convert';
 
 enum TransferTaskKind { file, text }
 
-enum TransferTaskStatus { pending, transferring, paused, failed, completed }
+enum TransferTaskStatus {
+  pending,
+  transferring,
+  verifying,
+  paused,
+  failed,
+  completed,
+}
 
 class TransferTask {
   const TransferTask._({
@@ -71,7 +78,9 @@ class TransferTask {
     }
 
     return _copyWith(
-      status: TransferTaskStatus.transferring,
+      status: kind == TransferTaskKind.file && bytes == totalBytes
+          ? TransferTaskStatus.verifying
+          : TransferTaskStatus.transferring,
       completedBytes: bytes,
     );
   }
@@ -88,13 +97,7 @@ class TransferTask {
   }
 
   TransferTask restart({required int completedBytes}) {
-    if (completedBytes < 0 || completedBytes > totalBytes) {
-      throw RangeError.range(completedBytes, 0, totalBytes, 'completedBytes');
-    }
-    return _copyWith(
-      status: TransferTaskStatus.transferring,
-      completedBytes: completedBytes,
-    );
+    return markBytesCompleted(completedBytes);
   }
 
   TransferTask _copyWith({TransferTaskStatus? status, int? completedBytes}) {

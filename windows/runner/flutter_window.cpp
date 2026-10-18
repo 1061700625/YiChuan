@@ -3,6 +3,8 @@
 #include <optional>
 #include <filesystem>
 #include <vector>
+#include <cwchar>
+#include <string>
 
 #include <commdlg.h>
 #include <shlobj.h>
@@ -41,8 +43,9 @@ bool FlutterWindow::OnCreate() {
           &flutter::StandardMethodCodec::GetInstance());
   file_picker_channel_->SetMethodCallHandler(
       [this](const auto& call, auto result) {
-        if (call.method_name() == "pickFile") {
-          std::vector<wchar_t> path_buffer(32768, L'\0');
+        if (call.method_name() == "pickFile" || call.method_name() == "pickFiles") {
+          const bool multiple = call.method_name() == "pickFiles";
+          std::vector<wchar_t> path_buffer(65536, L'\0');
           OPENFILENAMEW dialog = {};
           dialog.lStructSize = sizeof(dialog);
           dialog.hwndOwner = GetHandle();
@@ -52,25 +55,53 @@ bool FlutterWindow::OnCreate() {
           dialog.nFilterIndex = 1;
           dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
                          OFN_NOCHANGEDIR | OFN_EXPLORER;
+          if (multiple) dialog.Flags |= OFN_ALLOWMULTISELECT;
           if (!GetOpenFileNameW(&dialog)) {
-            result->Success();
+            const auto error = CommDlgExtendedError();
+            if (error != 0) {
+              result->Error("FILE_PICKER_ERROR",
+                            "Unable to select files (error " +
+                                std::to_string(error) + ").");
+            } else if (multiple) {
+              result->Success(flutter::EncodableValue(flutter::EncodableList{}));
+            } else {
+              result->Success();
+            }
             return;
           }
-          const std::filesystem::path path(path_buffer.data());
-          std::error_code error;
-          const auto size = std::filesystem::file_size(path, error);
-          if (error) {
-            result->Error("FILE_INFO_ERROR", error.message());
-            return;
+          const std::filesystem::path first(path_buffer.data());
+          const wchar_t* entry = path_buffer.data() + std::wcslen(path_buffer.data()) + 1;
+          std::vector<std::filesystem::path> paths;
+          if (multiple && *entry != L'\0') {
+            while (*entry != L'\0') {
+              paths.push_back(first / entry);
+              entry += std::wcslen(entry) + 1;
+            }
+          } else {
+            paths.push_back(first);
           }
-          flutter::EncodableMap value;
-          value[flutter::EncodableValue("path")] =
-              flutter::EncodableValue(Utf8FromUtf16(path.c_str()));
-          value[flutter::EncodableValue("name")] =
-              flutter::EncodableValue(Utf8FromUtf16(path.filename().c_str()));
-          value[flutter::EncodableValue("size")] =
-              flutter::EncodableValue(static_cast<int64_t>(size));
-          result->Success(flutter::EncodableValue(value));
+          flutter::EncodableList files;
+          for (const auto& path : paths) {
+            std::error_code error;
+            const auto size = std::filesystem::file_size(path, error);
+            if (error) {
+              result->Error("FILE_INFO_ERROR", error.message());
+              return;
+            }
+            flutter::EncodableMap value;
+            value[flutter::EncodableValue("path")] =
+                flutter::EncodableValue(Utf8FromUtf16(path.c_str()));
+            value[flutter::EncodableValue("name")] =
+                flutter::EncodableValue(Utf8FromUtf16(path.filename().c_str()));
+            value[flutter::EncodableValue("size")] =
+                flutter::EncodableValue(static_cast<int64_t>(size));
+            files.emplace_back(value);
+          }
+          if (multiple) {
+            result->Success(flutter::EncodableValue(files));
+          } else {
+            result->Success(files.front());
+          }
           return;
         }
 
@@ -119,6 +150,35 @@ bool FlutterWindow::OnCreate() {
               GetHandle(), L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
           if (opened <= 32) {
             result->Error("OPEN_ERROR", "Windows could not open the file.");
+          } else {
+            result->Success(flutter::EncodableValue(true));
+          }
+          return;
+        }
+
+        if (call.method_name() == "revealFile") {
+          const auto* arguments =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (arguments == nullptr) {
+            result->Error("INVALID_ARGS", "path required");
+            return;
+          }
+          const auto entry = arguments->find(flutter::EncodableValue("path"));
+          const auto* utf8_path = entry == arguments->end()
+              ? nullptr : std::get_if<std::string>(&entry->second);
+          if (utf8_path == nullptr) {
+            result->Error("INVALID_ARGS", "path required");
+            return;
+          }
+          const auto path = std::filesystem::u8path(*utf8_path).wstring();
+          PIDLIST_ABSOLUTE item = nullptr;
+          HRESULT status = SHParseDisplayName(path.c_str(), nullptr, &item, 0, nullptr);
+          if (SUCCEEDED(status)) {
+            status = SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
+            CoTaskMemFree(item);
+          }
+          if (FAILED(status)) {
+            result->Error("REVEAL_ERROR", "Windows could not locate the file.");
           } else {
             result->Success(flutter::EncodableValue(true));
           }

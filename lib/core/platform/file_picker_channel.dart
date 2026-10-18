@@ -4,14 +4,14 @@ import 'package:flutter/services.dart';
 
 const _channel = MethodChannel('com.localmesh/filepicker');
 
-/// Pick a single file using the platform's native file picker.
-/// Returns the file path, name, and size, or null if cancelled.
-Future<({String path, String name, int size})?> pickFile() async {
-  final result = await _channel.invokeMapMethod<String, Object?>('pickFile');
-  if (result == null) return null;
-  final path = result['path'];
-  final name = result['name'];
-  final size = result['size'];
+typedef PickedFile = ({String path, String name, int size});
+
+PickedFile _parsePickedFile(Object? value) {
+  if (value is! Map)
+    throw const FormatException('Platform returned an invalid file.');
+  final path = value['path'];
+  final name = value['name'];
+  final size = value['size'];
   if (path is! String ||
       path.isEmpty ||
       name is! String ||
@@ -21,6 +21,18 @@ Future<({String path, String name, int size})?> pickFile() async {
     throw const FormatException('Platform returned an invalid file.');
   }
   return (path: path, name: name, size: size);
+}
+
+/// Pick one or more files in the native picker. Cancellation returns an empty list.
+Future<List<PickedFile>> pickFiles() async {
+  final result = await _channel.invokeListMethod<Object?>('pickFiles');
+  return result?.map(_parsePickedFile).toList(growable: false) ?? [];
+}
+
+/// Single-file compatibility API.
+Future<PickedFile?> pickFile() async {
+  final result = await _channel.invokeMapMethod<String, Object?>('pickFile');
+  return result == null ? null : _parsePickedFile(result);
 }
 
 /// Get the download/received directory path from the platform.
@@ -71,10 +83,13 @@ Future<String?> moveToDownloads(String tempPath, String fileName) async {
 }
 
 /// Open a file via the system's default app using the content:// URI.
-Future<bool> openFile(String uri) async {
+Future<bool> openFile(String uri, {String? fileName}) async {
   try {
-    await _channel.invokeMethod('openFile', {'uri': uri});
-    return true;
+    return await _channel.invokeMethod<bool>('openFile', {
+          'uri': uri,
+          if (fileName != null) 'fileName': fileName,
+        }) ??
+        false;
   } catch (e) {
     return false;
   }
@@ -82,11 +97,28 @@ Future<bool> openFile(String uri) async {
 
 /// Open a local file (file system path) via the system's default app.
 /// Uses FileProvider on Android to create a content:// URI.
-Future<bool> openLocalFile(String path) async {
+Future<bool> openLocalFile(String path, {String? fileName}) async {
   try {
-    await _channel.invokeMethod('openLocalFile', {'path': path});
-    return true;
+    return await _channel.invokeMethod<bool>('openLocalFile', {
+          'path': path,
+          if (fileName != null) 'fileName': fileName,
+        }) ??
+        false;
   } catch (e) {
+    return false;
+  }
+}
+
+/// Ask the native file manager to reveal a file or its containing location.
+Future<bool> revealFile({String? uri, String? path}) async {
+  if (uri == null && path == null) return false;
+  try {
+    return await _channel.invokeMethod<bool>('revealFile', {
+          if (uri != null) 'uri': uri,
+          if (path != null) 'path': path,
+        }) ??
+        false;
+  } catch (_) {
     return false;
   }
 }

@@ -75,7 +75,7 @@ class TransferQueueService {
   }
 
   void startTransfer(String taskId) {
-    _updateTask(taskId, (t) => t.withStatus(TransferTaskStatus.transferring));
+    _updateTask(taskId, (t) => t.markBytesCompleted(t.completedBytes));
   }
 
   /// Update transfer progress with the receiver-confirmed byte count.
@@ -84,6 +84,10 @@ class TransferQueueService {
   /// move the task forward and clamp malformed values to the advertised size.
   void recordProgress(String taskId, {required int completedBytes}) {
     _updateTask(taskId, (task) {
+      if (task.status == TransferTaskStatus.completed ||
+          task.status == TransferTaskStatus.failed ||
+          task.status == TransferTaskStatus.paused)
+        return task;
       final confirmed = completedBytes.clamp(0, task.totalBytes).toInt();
       if (confirmed <= task.completedBytes) return task;
       return task.markBytesCompleted(confirmed);
@@ -158,6 +162,7 @@ class TransferQueueService {
     final index = _tasks.indexWhere((t) => t.id == taskId);
     if (index < 0) return;
     final updated = transform(_tasks[index]);
+    if (identical(updated, _tasks[index])) return;
     _tasks[index] = updated;
     _notify(updated);
   }

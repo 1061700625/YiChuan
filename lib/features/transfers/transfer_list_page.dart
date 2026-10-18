@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:developer' as developer;
 import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:crypto/crypto.dart';
+import '../../core/transfer/file_integrity.dart';
 
 import '../../core/transfer/transfer_task.dart';
 import '../../core/transfer/transfer_queue_service.dart';
@@ -32,6 +33,8 @@ class TransferListPage extends StatefulWidget {
 
 class _TransferListPageState extends State<TransferListPage> {
   bool _picking = false;
+  bool _sendingBatch = false;
+  Timer? _progressRefreshTimer;
   final _progressWaiters = <String, _ProgressWaiter>{};
   final _resumeWaiters = <String, Completer<TransferResumeDecision>>{};
   final _retryingTaskIds = <String>{};
@@ -46,6 +49,7 @@ class _TransferListPageState extends State<TransferListPage> {
 
   @override
   void dispose() {
+    _progressRefreshTimer?.cancel();
     widget.sessionService.removeListener(_onSessionChanged);
     widget.transferQueue.removeListener(_onTaskChanged);
     for (final waiter in _progressWaiters.values) {
@@ -79,7 +83,8 @@ class _TransferListPageState extends State<TransferListPage> {
     (task) =>
         !widget.transferQueue.isReceived(task.id) &&
         task.kind == TransferTaskKind.file &&
-        task.status == TransferTaskStatus.transferring,
+        (task.status == TransferTaskStatus.transferring ||
+            task.status == TransferTaskStatus.verifying),
   );
 
   void _onTaskChanged(TransferTask task) {
@@ -90,12 +95,12 @@ class _TransferListPageState extends State<TransferListPage> {
       if (!resumeWaiter.isCompleted) resumeWaiter.complete(resumeDecision);
     }
     final waiter = _progressWaiters[task.id];
-    if (waiter != null && task.status == TransferTaskStatus.failed) {
+    if (waiter != null &&
+        (task.status == TransferTaskStatus.failed ||
+            task.status == TransferTaskStatus.paused)) {
       _progressWaiters.remove(task.id);
       if (!waiter.completer.isCompleted) {
-        waiter.completer.completeError(
-          StateError('Receiver rejected the file.'),
-        );
+        waiter.completer.completeError(StateError('Transfer was interrupted.'));
       }
       if (mounted) setState(() {});
       return;
@@ -107,88 +112,125 @@ class _TransferListPageState extends State<TransferListPage> {
       _progressWaiters.remove(task.id);
       if (!waiter.completer.isCompleted) waiter.completer.complete();
     }
-    if (mounted) setState(() {});
+    if (task.status == TransferTaskStatus.transferring) {
+      _progressRefreshTimer ??= Timer(const Duration(milliseconds: 200), () {
+        _progressRefreshTimer = null;
+        if (mounted) setState(() {});
+      });
+    } else {
+      _progressRefreshTimer?.cancel();
+      _progressRefreshTimer = null;
+      if (mounted) setState(() {});
+    }
   }
 
   List<TransferTask> get _tasks => widget.transferQueue.tasks;
 
   String get _connectionStatus => _canSend ? '已连接 1 台设备' : '未连接';
 
+  bool _sameConnection(String clientId, String sessionId) =>
+      mounted &&
+      _canSend &&
+      widget.sessionService.pairedClientId == clientId &&
+      widget.sessionService.currentSessionId == sessionId;
+
   Future<void> _pickAndSendFile() async {
-    if (_picking) return;
+    if (_picking ||
+        _sendingBatch ||
+        _sendingFile ||
+        _retryingTaskIds.isNotEmpty)
+      return;
+    final clientId = widget.sessionService.pairedClientId;
+    final sessionId = widget.sessionService.currentSessionId;
+    if (clientId == null || sessionId == null || !_canSend) return;
     setState(() => _picking = true);
-
+    final batch = <({String id, PickedFile file})>[];
     try {
-      final picked = await pickFile();
-      if (picked == null) return;
-
-      final file = File(picked.path);
-      final fileSize = picked.size;
-      final fileName = picked.name;
-
-      final clientId = widget.sessionService.pairedClientId;
-      final sessionId = widget.sessionService.currentSessionId;
-      if (clientId == null || sessionId == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(const SnackBar(content: Text('没有已连接的设备，请先配对')));
-        }
-        return;
-      }
-      final fileHash = (await sha256.bind(file.openRead()).first).toString();
-      final resumeToken = _newResumeToken();
-
-      final taskId = 'send_${_newResumeToken()}';
-      widget.transferQueue.addOffer(
-        taskId: taskId,
-        fileName: fileName,
-        fileSize: fileSize,
-      );
-      widget.transferQueue.setResumeToken(taskId, resumeToken);
-
-      final offerMsg = ProtocolMessage(
-        type: ProtocolMessageType.transferOffer,
-        version: 1,
-        messageId: 'offer_$taskId',
-        sessionId: sessionId,
-        timestamp: DateTime.now(),
-        payload: {
-          'taskId': taskId,
-          'fileName': fileName,
-          'fileSize': fileSize,
-          'fileSha256': fileHash,
-          'resumeToken': resumeToken,
-        },
-      );
-
-      if (!await widget.networkService.send(clientId, offerMsg)) {
-        throw StateError('WebSocket connection was lost.');
-      }
-
-      widget.transferQueue.startTransfer(taskId);
-      // Store the file path so the sender can tap to open it later
-      widget.transferQueue.setSentFilePath(taskId, picked.path);
-
-      // Read and send chunks in the background
-      unawaited(
-        _sendFileChunks(
-          clientId,
-          sessionId,
-          taskId,
-          file,
-          fileSize,
-          expectedSha256: fileHash,
-        ),
-      );
-    } catch (e) {
-      if (mounted) {
+      final selected = await pickFiles();
+      if (!mounted || selected.isEmpty) return;
+      if (!_sameConnection(clientId, sessionId)) {
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text('选择文件出错: $e')));
+        ).showSnackBar(const SnackBar(content: Text('连接已改变，请重新选择文件')));
+        return;
       }
+      for (final picked in selected) {
+        final taskId = 'send_${_newResumeToken()}';
+        widget.transferQueue.addOffer(
+          taskId: taskId,
+          fileName: picked.name,
+          fileSize: picked.size,
+        );
+        widget.transferQueue.setSentFilePath(taskId, picked.path);
+        widget.transferQueue.setResumeToken(taskId, _newResumeToken());
+        batch.add((id: taskId, file: picked));
+      }
+      setState(() {
+        _picking = false;
+        _sendingBatch = true;
+      });
+      for (final item in batch) {
+        if (!_sameConnection(clientId, sessionId)) break;
+        try {
+          final file = File(item.file.path);
+          if (await file.length() != item.file.size)
+            throw StateError('文件大小已改变');
+          final hash = await computeFileSha256(file.path);
+          // A picker or hash can outlive a session; never send to a different peer.
+          if (!_sameConnection(clientId, sessionId)) break;
+          final sent = await widget.networkService.send(
+            clientId,
+            ProtocolMessage(
+              type: ProtocolMessageType.transferOffer,
+              version: 1,
+              messageId: 'offer_${item.id}',
+              sessionId: sessionId,
+              timestamp: DateTime.now(),
+              payload: {
+                'taskId': item.id,
+                'fileName': item.file.name,
+                'fileSize': item.file.size,
+                'fileSha256': hash,
+                'resumeToken': widget.transferQueue.getResumeToken(item.id),
+              },
+            ),
+          );
+          if (!sent) throw StateError('连接已断开');
+          widget.transferQueue.startTransfer(item.id);
+          await _sendFileChunks(
+            clientId,
+            sessionId,
+            item.id,
+            file,
+            item.file.size,
+            expectedSha256: hash,
+          );
+        } catch (error) {
+          widget.transferQueue.fail(item.id);
+          if (mounted)
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('${item.file.name} 发送失败: $error')),
+            );
+        }
+      }
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('选择文件出错: $error')));
     } finally {
-      if (mounted) setState(() => _picking = false);
+      // Retain paths/tokens so interrupted queued files can be retried individually.
+      for (final item in batch) {
+        if (widget.transferQueue.findTask(item.id)?.status ==
+            TransferTaskStatus.pending) {
+          widget.transferQueue.pause(item.id);
+        }
+      }
+      if (mounted)
+        setState(() {
+          _picking = false;
+          _sendingBatch = false;
+        });
     }
   }
 
@@ -263,6 +305,15 @@ class _TransferListPageState extends State<TransferListPage> {
 
   Future<void> _retryFile(TransferTask task) async {
     if (_retryingTaskIds.contains(task.id)) return;
+    if (_sendingBatch ||
+        _sendingFile ||
+        _picking ||
+        _retryingTaskIds.isNotEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请等待当前文件队列完成后重试')));
+      return;
+    }
     final clientId = widget.sessionService.pairedClientId;
     final sessionId = widget.sessionService.currentSessionId;
     if (clientId == null || sessionId == null) {
@@ -287,7 +338,7 @@ class _TransferListPageState extends State<TransferListPage> {
       if (!await file.exists() || await file.length() != task.totalBytes) {
         throw StateError('发送源文件不存在或大小已改变');
       }
-      final fileHash = (await sha256.bind(file.openRead()).first).toString();
+      final fileHash = await computeFileSha256(file.path);
       widget.transferQueue.takeResumeDecision(task.id);
       final resumeCompleter = Completer<TransferResumeDecision>();
       _resumeWaiters[task.id] = resumeCompleter;
@@ -388,25 +439,36 @@ class _TransferListPageState extends State<TransferListPage> {
     required String expectedSha256,
     int startOffset = 0,
   }) async {
-    // Larger binary chunks reduce framing and UI update overhead.
-    // Keep a small acknowledged window so WebSocket cannot buffer an entire
-    // large file while the receiver is still decoding and writing it.
-    const chunkSize = 256 * 1024;
-    const chunksPerWindow = 4;
+    // Bound queued data while refilling as soon as individual chunks are
+    // acknowledged, rather than draining the entire window between batches.
+    const chunkSize = 1024 * 1024;
+    const windowBytes = 8 * 1024 * 1024;
     RandomAccessFile? raf;
     int offset = startOffset;
-    int chunkIndex = 0;
     final buffer = Uint8List(chunkSize);
+    final totalTime = Stopwatch()..start();
+    final readTime = Stopwatch();
+    final enqueueTime = Stopwatch();
+    final acknowledgmentTime = Stopwatch();
 
     try {
       raf = await file.open(mode: FileMode.read);
       await raf.setPosition(startOffset);
       while (offset < fileSize) {
+        final nextBytes = min(chunkSize, fileSize - offset);
+        acknowledgmentTime.start();
+        await _waitForReceiverProgress(
+          taskId,
+          max(startOffset, offset + nextBytes - windowBytes),
+        );
+        acknowledgmentTime.stop();
+        readTime.start();
         final bytesRead = await raf.readInto(
           buffer,
           0,
           min(chunkSize, fileSize - offset),
         );
+        readTime.stop();
         if (bytesRead == 0) break;
 
         final chunk = Uint8List.sublistView(buffer, 0, bytesRead);
@@ -417,21 +479,21 @@ class _TransferListPageState extends State<TransferListPage> {
           data: chunk,
         ).encode();
 
+        enqueueTime.start();
         final sent = await widget.networkService.sendBinary(
           clientId,
           chunkFrame,
         );
+        enqueueTime.stop();
         if (!sent) {
           throw StateError('WebSocket connection was lost.');
         }
 
         offset += bytesRead;
-        chunkIndex++;
-
-        if (chunkIndex % chunksPerWindow == 0 || offset >= fileSize) {
-          await _waitForReceiverProgress(taskId, offset);
-        }
       }
+      acknowledgmentTime.start();
+      await _waitForReceiverProgress(taskId, offset);
+      acknowledgmentTime.stop();
       if (offset != fileSize) {
         throw StateError('The selected file changed while it was being sent.');
       }
@@ -453,6 +515,14 @@ class _TransferListPageState extends State<TransferListPage> {
       return;
     } finally {
       await raf?.close();
+      totalTime.stop();
+      developer.log(
+        'bytes=${offset - startOffset} readMs=${readTime.elapsedMilliseconds} '
+        'enqueueMs=${enqueueTime.elapsedMilliseconds} '
+        'ackWaitMs=${acknowledgmentTime.elapsedMilliseconds} '
+        'totalMs=${totalTime.elapsedMilliseconds}',
+        name: 'yichuan.transfer.send',
+      );
       _progressWaiters.remove(taskId);
     }
 
@@ -484,7 +554,8 @@ class _TransferListPageState extends State<TransferListPage> {
 
   Future<void> _waitForReceiverProgress(String taskId, int targetBytes) {
     final task = widget.transferQueue.findTask(taskId);
-    if (task?.status == TransferTaskStatus.failed) {
+    if (task?.status == TransferTaskStatus.failed ||
+        task?.status == TransferTaskStatus.paused) {
       return Future.error(StateError('Receiver rejected the file.'));
     }
     if (task == null || task.completedBytes >= targetBytes) {
@@ -503,7 +574,8 @@ class _TransferListPageState extends State<TransferListPage> {
   Future<void> _waitForReceiverCompletion(String taskId, int totalBytes) {
     final task = widget.transferQueue.findTask(taskId);
     if (task?.status == TransferTaskStatus.completed) return Future.value();
-    if (task?.status == TransferTaskStatus.failed) {
+    if (task?.status == TransferTaskStatus.failed ||
+        task?.status == TransferTaskStatus.paused) {
       return Future.error(StateError('Receiver rejected the file.'));
     }
     final completer = Completer<void>();
@@ -512,7 +584,7 @@ class _TransferListPageState extends State<TransferListPage> {
       completer: completer,
       requireCompletion: true,
     );
-    return completer.future.timeout(const Duration(seconds: 30));
+    return completer.future.timeout(const Duration(minutes: 5));
   }
 
   Future<void> _showDeleteMenu(TransferTask task) async {
@@ -689,6 +761,7 @@ class _TransferListPageState extends State<TransferListPage> {
                       (task) =>
                           task.status == TransferTaskStatus.pending ||
                           task.status == TransferTaskStatus.transferring ||
+                          task.status == TransferTaskStatus.verifying ||
                           task.status == TransferTaskStatus.paused,
                     )
                 ? null
@@ -738,7 +811,13 @@ class _TransferListPageState extends State<TransferListPage> {
                 const SizedBox(height: 12),
                 FloatingActionButton.extended(
                   heroTag: 'send-file',
-                  onPressed: _picking || _sendingFile ? null : _pickAndSendFile,
+                  onPressed:
+                      _picking ||
+                          _sendingBatch ||
+                          _sendingFile ||
+                          _retryingTaskIds.isNotEmpty
+                      ? null
+                      : _pickAndSendFile,
                   icon: _picking
                       ? const SizedBox(
                           width: 16,
@@ -749,7 +828,13 @@ class _TransferListPageState extends State<TransferListPage> {
                           ),
                         )
                       : const Icon(Icons.file_upload),
-                  label: Text(_picking ? '选择中…' : '发送文件'),
+                  label: Text(
+                    _picking
+                        ? '选择中…'
+                        : _sendingBatch
+                        ? '发送队列中…'
+                        : '发送文件',
+                  ),
                 ),
               ],
             ),
@@ -861,12 +946,34 @@ class _TransferTaskCard extends StatelessWidget {
   bool get _isInteractive =>
       _canOpen || onLongPress != null || onRetry != null || onTextTap != null;
 
+  Future<void> _openWithFallback(BuildContext context) async {
+    final opened = fileUri != null
+        ? await openFile(fileUri!, fileName: task.fileName)
+        : localPath != null &&
+              await openLocalFile(localPath!, fileName: task.fileName);
+    if (!opened && context.mounted) await _revealLocation(context);
+  }
+
+  Future<void> _revealLocation(BuildContext context) async {
+    final revealed = await revealFile(uri: fileUri, path: localPath);
+    if (!revealed && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '无法打开或定位文件，请在文件管理器中查找：${fileUri != null ? 'Download/驿传/${task.fileName}' : localPath}',
+          ),
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final statusColor = switch (task.status) {
       TransferTaskStatus.completed => scheme.primary,
       TransferTaskStatus.failed => scheme.error,
-      TransferTaskStatus.transferring => scheme.tertiary,
+      TransferTaskStatus.transferring ||
+      TransferTaskStatus.verifying => scheme.tertiary,
       TransferTaskStatus.paused => scheme.outline,
       _ => scheme.outlineVariant,
     };
@@ -874,6 +981,7 @@ class _TransferTaskCard extends StatelessWidget {
     final statusLabel = switch (task.status) {
       TransferTaskStatus.pending => '等待中',
       TransferTaskStatus.transferring => '传输中',
+      TransferTaskStatus.verifying => '校验中',
       TransferTaskStatus.paused => '已暂停',
       TransferTaskStatus.failed => '失败',
       TransferTaskStatus.completed => '已完成',
@@ -889,19 +997,12 @@ class _TransferTaskCard extends StatelessWidget {
           ? InkWell(
               onTap:
                   onTextTap ??
-                  (_canOpen
-                      ? () {
-                          if (fileUri != null) {
-                            openFile(fileUri!);
-                          } else if (localPath != null) {
-                            openLocalFile(localPath!);
-                          }
-                        }
-                      : null),
+                  (_canOpen ? () => _openWithFallback(context) : null),
               onLongPress: onLongPress,
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: _cardBody(
+                  context,
                   scheme,
                   textTheme,
                   statusColor,
@@ -913,6 +1014,7 @@ class _TransferTaskCard extends StatelessWidget {
           : Padding(
               padding: const EdgeInsets.all(16),
               child: _cardBody(
+                context,
                 scheme,
                 textTheme,
                 statusColor,
@@ -924,6 +1026,7 @@ class _TransferTaskCard extends StatelessWidget {
   }
 
   Widget _cardBody(
+    BuildContext context,
     ColorScheme scheme,
     TextTheme textTheme,
     Color statusColor,
@@ -987,7 +1090,9 @@ class _TransferTaskCard extends StatelessWidget {
           ClipRRect(
             borderRadius: BorderRadius.circular(6),
             child: LinearProgressIndicator(
-              value: task.progress,
+              value: task.status == TransferTaskStatus.verifying
+                  ? null
+                  : task.progress,
               minHeight: 4,
               backgroundColor: scheme.surfaceContainerHighest,
               color: statusColor,
@@ -1006,6 +1111,11 @@ class _TransferTaskCard extends StatelessWidget {
                 color: scheme.primary,
                 fontStyle: FontStyle.italic,
               ),
+            ),
+            TextButton.icon(
+              onPressed: () => _revealLocation(context),
+              icon: const Icon(Icons.folder_open, size: 18),
+              label: const Text('打开所在位置'),
             ),
           ],
           if (onRetry != null) ...[

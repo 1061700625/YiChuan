@@ -1,6 +1,10 @@
 package com.localmesh.local_mesh_transfer
 
 import android.Manifest
+import android.app.DownloadManager
+import android.content.ClipData
+import android.provider.DocumentsContract
+import android.widget.Toast
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -19,6 +23,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.util.Locale
 
 class MainActivity : FlutterActivity() {
     private companion object {
@@ -32,6 +37,7 @@ class MainActivity : FlutterActivity() {
 
     private var pendingNearbyResult: MethodChannel.Result? = null
     private var pendingFilePickerResult: MethodChannel.Result? = null
+    private var pendingPickerMultiple = false
     private var pendingNotificationResult: MethodChannel.Result? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
@@ -155,15 +161,22 @@ class MainActivity : FlutterActivity() {
             FILEPICKER_CHANNEL
         ).setMethodCallHandler { call, result ->
             when (call.method) {
-                "pickFile" -> {
+                "pickFile", "pickFiles" -> {
+                    if (pendingFilePickerResult != null) {
+                        result.error("FILE_PICKER_BUSY", "A file selection is already pending", null)
+                        return@setMethodCallHandler
+                    }
                     try {
+                        pendingPickerMultiple = call.method == "pickFiles"
                         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                             addCategory(Intent.CATEGORY_OPENABLE)
                             type = "*/*"
+                            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, pendingPickerMultiple)
                         }
                         pendingFilePickerResult = result
                         startActivityForResult(intent, REQUEST_PICK_FILE)
                     } catch (e: Exception) {
+                        pendingFilePickerResult = null
                         result.error("FILE_PICKER_ERROR", e.message, null)
                     }
                 }
@@ -241,13 +254,8 @@ class MainActivity : FlutterActivity() {
                         return@setMethodCallHandler
                     }
                     try {
-                        val uri = android.net.Uri.parse(uriStr)
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, getMimeType(uri.lastPathSegment ?: ""))
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        startActivity(intent)
+                        val uri = Uri.parse(uriStr)
+                        openSharedFile(uri, call.argument<String>("fileName"))
                         result.success(true)
                     } catch (e: Exception) {
                         result.error("OPEN_ERROR", "Failed to open file: ${e.message}", null)
@@ -279,15 +287,39 @@ class MainActivity : FlutterActivity() {
                             "$packageName.fileprovider",
                             file
                         )
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, getMimeType(file.name))
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        startActivity(intent)
+                        if (!file.isFile) throw IllegalStateException("File no longer exists")
+                        openSharedFile(uri, call.argument<String>("fileName") ?: file.name)
                         result.success(true)
                     } catch (e: Exception) {
                         result.error("OPEN_ERROR", "Failed to open local file: ${e.message}", null)
+                    }
+                }
+                "revealFile" -> {
+                    val uri = call.argument<String>("uri")?.let(Uri::parse)
+                    // External file managers cannot browse private app/cache directories.
+                    if (uri?.authority != MediaStore.AUTHORITY) {
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val directory = DocumentsContract.buildDocumentUri(
+                            "com.android.externalstorage.documents",
+                            "primary:${Environment.DIRECTORY_DOWNLOADS}/驿传"
+                        )
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(directory, DocumentsContract.Document.MIME_TYPE_DIR)
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            })
+                        } catch (_: Exception) {
+                            startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            })
+                            Toast.makeText(this, "已打开下载列表，请查找 Download/驿传 中的文件", Toast.LENGTH_LONG).show()
+                        }
+                        result.success(true)
+                    } catch (error: Exception) {
+                        result.error("REVEAL_ERROR", "Unable to open Downloads: ${error.message}", null)
                     }
                 }
                 "openExternalUrl" -> {
@@ -332,28 +364,49 @@ class MainActivity : FlutterActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_PICK_FILE) {
-            if (resultCode == RESULT_OK && data?.data != null) {
-                val uri = data.data!!
-                try {
-                    // Copy file from content URI to cache dir so dart:io can access it
-                    val cacheDir = cacheDir
-                    val cacheFile = File(cacheDir, "picked_${System.currentTimeMillis()}")
-                    val input = applicationContext.contentResolver.openInputStream(uri)
-                        ?: throw IllegalStateException("Unable to open selected file")
-                    input.use {
-                        cacheFile.outputStream().use { output -> it.copyTo(output) }
-                    }
-                    val name = getDisplayName(uri) ?: "unknown"
-                    val size = cacheFile.length()
-                    pendingFilePickerResult?.success(
-                        mapOf("path" to cacheFile.absolutePath, "name" to name, "size" to size)
-                    )
-                    pendingFilePickerResult = null
-                    return
-                } catch (_: Exception) {}
+            val result = pendingFilePickerResult ?: return
+            val multiple = pendingPickerMultiple
+            if (resultCode != RESULT_OK || data == null) {
+                pendingFilePickerResult = null
+                result.success(if (multiple) emptyList<Any>() else null)
+                return
             }
-            pendingFilePickerResult?.success(null)
-            pendingFilePickerResult = null
+            val uris = mutableListOf<Uri>()
+            val clips = data.clipData
+            if (clips != null) {
+                for (index in 0 until clips.itemCount) uris.add(clips.getItemAt(index).uri)
+            } else {
+                data.data?.let { uris.add(it) }
+            }
+            // Copy content URIs off the UI thread. Each file needs a unique path,
+            // including identically named files selected from different providers.
+            Thread {
+                val copies = mutableListOf<File>()
+                try {
+                    val files = uris.distinct().map { uri ->
+                        val cacheFile = File.createTempFile("picked_", ".tmp", cacheDir)
+                        copies.add(cacheFile)
+                        val input = contentResolver.openInputStream(uri)
+                            ?: throw IllegalStateException("Unable to open selected file")
+                        input.use { source ->
+                            cacheFile.outputStream().use { output -> source.copyTo(output) }
+                        }
+                        mapOf("path" to cacheFile.absolutePath,
+                              "name" to (getDisplayName(uri) ?: "unknown"),
+                              "size" to cacheFile.length())
+                    }
+                    runOnUiThread {
+                        pendingFilePickerResult = null
+                        result.success(if (multiple) files else files.firstOrNull())
+                    }
+                } catch (error: Exception) {
+                    copies.forEach { it.delete() }
+                    runOnUiThread {
+                        pendingFilePickerResult = null
+                        result.error("FILE_PICKER_ERROR", error.message, null)
+                    }
+                }
+            }.start()
         }
     }
 
@@ -379,8 +432,24 @@ class MainActivity : FlutterActivity() {
         return name
     }
 
+    private fun openSharedFile(uri: Uri, fileName: String?) {
+        val name = fileName ?: getDisplayName(uri) ?: ""
+        val fromName = getMimeType(name)
+        val mime = if (fromName != "application/octet-stream") fromName
+                   else contentResolver.getType(uri) ?: fromName
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime)
+            clipData = ClipData.newRawUri("file", uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        // For APKs Android displays its installer and, if necessary, its own
+        // unknown-source permission prompt. Installation still requires consent.
+        startActivity(intent)
+    }
+
     private fun getMimeType(fileName: String): String {
-        val extension = MimeTypeMap.getFileExtensionFromUrl(fileName).lowercase()
+        val extension = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        if (extension == "apk") return "application/vnd.android.package-archive"
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
             ?: "application/octet-stream"
     }

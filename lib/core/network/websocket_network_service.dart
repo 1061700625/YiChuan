@@ -72,7 +72,10 @@ class WebSocketNetworkService implements NetworkService {
 
     _server!.listen((HttpRequest request) async {
       if (WebSocketTransformer.isUpgradeRequest(request)) {
-        final webSocket = await WebSocketTransformer.upgrade(request);
+        final webSocket = await WebSocketTransformer.upgrade(
+          request,
+          compression: CompressionOptions.compressionOff,
+        );
         webSocket.pingInterval = _pingInterval;
         final id = 'client_${_nextId++}';
         _clients[id] = webSocket;
@@ -94,7 +97,10 @@ class WebSocketNetworkService implements NetworkService {
   @override
   Future<String?> connect({required String host, required int port}) async {
     try {
-      final socket = await WebSocket.connect('ws://$host:$port');
+      final socket = await WebSocket.connect(
+        'ws://$host:$port',
+        compression: CompressionOptions.compressionOff,
+      );
       socket.pingInterval = _pingInterval;
       final id = 'client_${_nextId++}';
       _clients[id] = socket;
