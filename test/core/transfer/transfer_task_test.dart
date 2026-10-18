@@ -3,41 +3,39 @@ import 'package:local_mesh_transfer/core/transfer/transfer_task.dart';
 
 void main() {
   group('TransferTask', () {
-    test('tracks file transfer progress by completed bytes', () {
+    test('tracks confirmed bytes without claiming integrity completion', () {
       final task = TransferTask.file(
         id: 'task-1',
         fileName: 'video.mp4',
         totalBytes: 100,
-        checksum: 'sha256-demo',
       );
 
-      final updated = task.markBytesCompleted(25);
+      final received = task.markBytesCompleted(100);
 
-      expect(updated.status, TransferTaskStatus.transferring);
-      expect(updated.completedBytes, 25);
-      expect(updated.progress, 0.25);
+      expect(received.completedBytes, 100);
+      expect(received.progress, 1);
+      expect(received.status, TransferTaskStatus.transferring);
+      expect(received.markCompleted().status, TransferTaskStatus.completed);
     });
 
-    test('marks task completed when completed bytes reach total bytes', () {
+    test('handles an explicitly completed zero-byte file', () {
       final task = TransferTask.file(
-        id: 'task-1',
-        fileName: 'video.mp4',
-        totalBytes: 100,
-        checksum: 'sha256-demo',
-      );
+        id: 'task-2',
+        fileName: 'empty.txt',
+        totalBytes: 0,
+      ).markCompleted();
 
-      final updated = task.markBytesCompleted(100);
-
-      expect(updated.status, TransferTaskStatus.completed);
-      expect(updated.progress, 1.0);
+      expect(task.progress, 1);
+      expect(task.status, TransferTaskStatus.completed);
     });
 
-    test('creates lightweight text transfer without file chunks', () {
-      final task = TransferTask.text(id: 'task-2', text: 'hello');
+    test('creates a completed UTF-8 text task', () {
+      final task = TransferTask.text(id: 'text-1', text: '你好');
 
       expect(task.kind, TransferTaskKind.text);
-      expect(task.totalBytes, 5);
-      expect(task.fileName, isNull);
+      expect(task.text, '你好');
+      expect(task.totalBytes, 6);
+      expect(task.status, TransferTaskStatus.completed);
     });
   });
 }
