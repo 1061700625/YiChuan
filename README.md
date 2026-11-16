@@ -123,3 +123,24 @@ Android 会将选中文件复制到独立缓存路径，复制在后台线程执
 点击已完成的文件可交给系统应用打开。Android 使用原始文件名判断类型，APK 会调起系统安装界面，首次使用可能需要允许驿传安装应用。
 
 已完成文件提供“打开所在位置”按钮，打开文件失败时也会自动尝试定位。macOS 和 Windows 在文件管理器中选中文件；Android 尝试打开 `Download/驿传`，不支持目录跳转的系统会退回下载列表。应用私有缓存无法由外部文件管理器浏览，无法打开或定位时会显示提示。
+
+### 开发环境与统一验证
+
+项目在 `.fvmrc` 固定 Flutter **3.44.7**。可通过 FVM 安装该版本，或设置
+`FLUTTER_ROOT` 指向已有 SDK。Android 构建使用 **JDK 17**；通过 `JAVA_HOME`
+选择，macOS 未设置时验证脚本会自动查找 JDK 17。
+
+```bash
+export FLUTTER_ROOT=/path/to/flutter
+export JAVA_HOME=/path/to/jdk-17
+# 可选：中国镜像
+export PUB_HOSTED_URL=https://pub.flutter-io.cn
+export FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn
+
+./tool/verify.sh              # 依赖、静态分析、全部测试、Android debug APK
+./tool/verify.sh --no-android # 仅 Dart/Flutter 检查
+```
+
+删除或清空传输记录会取消该任务的等待与续传缓存；已完成文件会保留。
+未完成任务的临时接收文件会清理，后续需重新发起传输。
+信任信息按顺序写入同目录临时文件，刷新后再替换正式文件，避免写到一半破坏旧文件。

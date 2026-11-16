@@ -72,6 +72,11 @@ class DiscoveryService {
     });
   }
 
+  /// Clear cached results while keeping discovery sockets and timers running.
+  void clearDiscoveredDevices() {
+    _devices.clear();
+  }
+
   void stopScanning() {
     _isScanning = false;
     _cleanupTimer?.cancel();

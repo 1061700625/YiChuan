@@ -13,6 +13,7 @@ class TransferQueueService {
   final _savedFileUris = <String, String>{};
   final _receivedFilePaths = <String, String>{};
   final _sentFilePaths = <String, String>{};
+  final _sentFileSha256 = <String, String>{};
   final _receivedTaskIds = <String>{};
   final _resumeTokens = <String, String>{};
   final _resumeDecisions = <String, TransferResumeDecision>{};
@@ -28,6 +29,9 @@ class TransferQueueService {
   String? getSentFilePath(String taskId) => _sentFilePaths[taskId];
   void setSentFilePath(String taskId, String path) =>
       _sentFilePaths[taskId] = path;
+  String? getSentFileSha256(String taskId) => _sentFileSha256[taskId];
+  void setSentFileSha256(String taskId, String hash) =>
+      _sentFileSha256[taskId] = hash;
   bool isReceived(String taskId) => _receivedTaskIds.contains(taskId);
   void markReceived(String taskId) => _receivedTaskIds.add(taskId);
   String? getResumeToken(String taskId) => _resumeTokens[taskId];
@@ -134,6 +138,7 @@ class TransferQueueService {
     _savedFileUris.remove(taskId);
     _receivedFilePaths.remove(taskId);
     _sentFilePaths.remove(taskId);
+    _sentFileSha256.remove(taskId);
     _receivedTaskIds.remove(taskId);
     _resumeTokens.remove(taskId);
     _resumeDecisions.remove(taskId);
@@ -147,6 +152,7 @@ class TransferQueueService {
     _savedFileUris.clear();
     _receivedFilePaths.clear();
     _sentFilePaths.clear();
+    _sentFileSha256.clear();
     _receivedTaskIds.clear();
     _resumeTokens.clear();
     _resumeDecisions.clear();

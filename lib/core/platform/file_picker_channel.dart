@@ -52,6 +52,68 @@ Future<String> getDownloadDir() async {
   return receivedDir.path;
 }
 
+/// Delete a staged picker copy named by [path], or every staged copy when
+/// [path] is null.
+///
+/// Refuses to touch anything outside the staging directory, so the user's real
+/// file can never be removed this way. On macOS and Windows the picker returns
+/// the original with no copy, so this is a no-op there.
+Future<void> deletePickedFile(String? path) async {
+  final root = await getPickerTempDir();
+  if (root == null) return;
+  await deleteStagedPickedFile(root, path);
+}
+
+/// Delete [path], or every staged copy in [root] when [path] is null.
+///
+/// Only removes regular files that live directly inside [root] and end in
+/// `.tmp`, the shape the picker creates. Anything outside [root] is left
+/// exactly as it was, which is what keeps the user's real file safe.
+Future<void> deleteStagedPickedFile(String root, String? path) async {
+  final prefix = '$root${Platform.pathSeparator}';
+  Future<void> remove(File file) async {
+    if (!file.path.startsWith(prefix) || !file.path.endsWith('.tmp')) return;
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // A copy may already be gone, or the platform may refuse the delete.
+    }
+  }
+
+  if (path != null) {
+    await remove(File(path));
+    return;
+  }
+
+  try {
+    final dir = Directory(root);
+    if (!await dir.exists()) return;
+    await for (final entity in dir.list()) {
+      if (entity is File && entity.path.endsWith('.tmp')) {
+        await remove(entity);
+      }
+    }
+  } catch (_) {
+    // The staging directory may be unreadable; leave stale copies alone.
+  }
+}
+
+/// Directory where Android stages picker selections, or null elsewhere.
+///
+/// Only Android copies a selection into a local temp file (its content:// URI is
+/// not readable by the sender after the dialog closes). On macOS and Windows the
+/// picker returns the user's real file, so there is nothing to clean up and this
+/// returns null.
+Future<String?> getPickerTempDir() async {
+  if (!Platform.isAndroid) return null;
+  try {
+    final dir = await _channel.invokeMethod<String>('getPickerTempDir');
+    return (dir == null || dir.isEmpty) ? null : dir;
+  } catch (_) {
+    return null;
+  }
+}
+
 /// Keep authentication credentials outside the received-files directory.
 Future<String> getStateDir() async {
   if (Platform.isAndroid) {
@@ -148,6 +210,18 @@ Future<bool> deleteReceivedFile({String? uri, String? path}) async {
       if (await file.exists()) await file.delete();
     }
     return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<bool> verifySavedFile(String uri, String sha256) async {
+  try {
+    return await _channel.invokeMethod<bool>('verifySavedFile', {
+          'uri': uri,
+          'sha256': sha256,
+        }) ??
+        false;
   } catch (_) {
     return false;
   }

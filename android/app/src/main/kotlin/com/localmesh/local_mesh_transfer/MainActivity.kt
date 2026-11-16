@@ -181,6 +181,9 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "getStateDir" -> result.success(filesDir.absolutePath)
+                // Selected files are staged here so content:// URIs stay readable.
+                // Report the path so the Dart side can discard stale copies.
+                "getPickerTempDir" -> result.success(cacheDir.absolutePath)
                 "getDownloadDir" -> {
                     // Use app's private filesDir for temporary storage
                     val received = File(filesDir, "received")
@@ -194,58 +197,58 @@ class MainActivity : FlutterActivity() {
                         result.error("INVALID_ARGS", "tempPath and fileName required", null)
                         return@setMethodCallHandler
                     }
-                    try {
-                        val tempFile = File(tempPath)
-                        if (!tempFile.exists()) {
-                            result.error("FILE_NOT_FOUND", "Temp file not found: $tempPath", null)
-                            return@setMethodCallHandler
-                        }
-
-                        // Create MediaStore entry under Download/驿传/
-                        val contentValues = ContentValues().apply {
-                            put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                            put(MediaStore.Downloads.MIME_TYPE, getMimeType(fileName))
-                            put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/驿传")
-                            put(MediaStore.Downloads.IS_PENDING, 1)
-                        }
-
-                        val uri = contentResolver.insert(
-                            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                            contentValues
-                        )
-
-                        if (uri == null) {
-                            result.error("MEDIASTORE_FAILED", "Failed to create MediaStore entry", null)
-                            return@setMethodCallHandler
-                        }
-
+                    Thread {
                         try {
-                            val output = contentResolver.openOutputStream(uri)
-                                ?: throw IllegalStateException("Failed to open MediaStore output")
-                            output.use {
-                                tempFile.inputStream().use { input -> input.copyTo(it) }
+                            val tempFile = File(tempPath)
+                            if (!tempFile.exists()) {
+                                throw IllegalStateException("Temp file not found: $tempPath")
                             }
 
-                            // Mark as not pending only after the full copy succeeds.
-                            val updateValues = ContentValues().apply {
-                                put(MediaStore.Downloads.IS_PENDING, 0)
-                            }
-                            if (contentResolver.update(uri, updateValues, null, null) != 1) {
-                                throw IllegalStateException("Failed to publish MediaStore entry")
-                            }
-
-                            if (!tempFile.delete()) {
-                                throw IllegalStateException("Failed to remove temporary file")
+                            // Create MediaStore entry under Download/驿传/
+                            val contentValues = ContentValues().apply {
+                                put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                                put(MediaStore.Downloads.MIME_TYPE, getMimeType(fileName))
+                                put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/驿传")
+                                put(MediaStore.Downloads.IS_PENDING, 1)
                             }
 
-                            result.success(uri.toString())
+                            val uri = contentResolver.insert(
+                                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                                contentValues
+                            )
+
+                            if (uri == null) {
+                                throw IllegalStateException("Failed to create MediaStore entry")
+                            }
+
+                            try {
+                                val output = contentResolver.openOutputStream(uri)
+                                    ?: throw IllegalStateException("Failed to open MediaStore output")
+                                output.use {
+                                    tempFile.inputStream().use { input -> input.copyTo(it) }
+                                }
+
+                                // Mark as not pending only after the full copy succeeds.
+                                val updateValues = ContentValues().apply {
+                                    put(MediaStore.Downloads.IS_PENDING, 0)
+                                }
+                                if (contentResolver.update(uri, updateValues, null, null) != 1) {
+                                    throw IllegalStateException("Failed to publish MediaStore entry")
+                                }
+
+                                if (!tempFile.delete()) {
+                                    throw IllegalStateException("Failed to remove temporary file")
+                                }
+
+                                runOnUiThread { result.success(uri.toString()) }
+                            } catch (e: Exception) {
+                                contentResolver.delete(uri, null, null)
+                                throw e
+                            }
                         } catch (e: Exception) {
-                            contentResolver.delete(uri, null, null)
-                            throw e
+                            runOnUiThread { result.error("MOVE_ERROR", "Failed to move file: ${e.message}", null) }
                         }
-                    } catch (e: Exception) {
-                        result.error("MOVE_ERROR", "Failed to move file: ${e.message}", null)
-                    }
+                    }.start()
                 }
                 "openFile" -> {
                     val uriStr = call.argument<String>("uri")
@@ -260,6 +263,28 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         result.error("OPEN_ERROR", "Failed to open file: ${e.message}", null)
                     }
+                }
+                "verifySavedFile" -> {
+                    val uri = call.argument<String>("uri")
+                    val expected = call.argument<String>("sha256")
+                    Thread {
+                        val valid = try {
+                            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                            val input = contentResolver.openInputStream(Uri.parse(uri!!))
+                            if (input == null) false else {
+                                input.use { stream ->
+                                    val buffer = ByteArray(65536)
+                                    var count = stream.read(buffer)
+                                    while (count != -1) {
+                                        digest.update(buffer, 0, count)
+                                        count = stream.read(buffer)
+                                    }
+                                }
+                                digest.digest().joinToString("") { "%02x".format(it) } == expected
+                            }
+                        } catch (_: Exception) { false }
+                        runOnUiThread { result.success(valid) }
+                    }.start()
                 }
                 "deleteFile" -> {
                     val uriStr = call.argument<String>("uri")

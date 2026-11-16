@@ -5,6 +5,7 @@ import 'dart:developer' as developer;
 import 'dart:typed_data';
 
 import '../core/transfer/file_integrity.dart';
+import '../core/transfer/incoming_transfer.dart';
 import 'package:flutter/material.dart';
 
 import '../core/discovery/subnet_scanner.dart';
@@ -14,7 +15,8 @@ import '../core/network/network_service.dart';
 import '../core/platform/android_permissions.dart';
 import '../core/platform/device_identity.dart';
 import '../core/platform/file_picker_channel.dart'
-    show getDownloadDir, getStateDir, moveToDownloads;
+    show deletePickedFile, getDownloadDir, getStateDir, moveToDownloads,
+        verifySavedFile;
 import '../core/platform/network_info.dart';
 import '../core/protocol/binary_transfer_chunk.dart';
 import '../core/protocol/protocol_message.dart';
@@ -33,12 +35,14 @@ class LocalMeshTransferApp extends StatefulWidget {
     this.networkService,
     this.discoveryService,
     this.dataDirectory,
+    this.fileHasher = computeFileSha256,
     super.key,
   });
 
   final NetworkService? networkService;
   final UdpDiscoveryService? discoveryService;
   final Directory? dataDirectory;
+  final Future<String> Function(String path) fileHasher;
 
   @override
   State<LocalMeshTransferApp> createState() => _LocalMeshTransferAppState();
@@ -58,7 +62,7 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
   late final UdpDiscoveryService _discoveryService;
   late final NetworkService _networkService;
   late final TransferQueueService _transferQueue;
-  final _incomingFiles = <String, _IncomingFile>{};
+  final _incomingFiles = <String, IncomingTransfer>{};
 
   String _statusMessage = '';
   String? _localIp;
@@ -75,6 +79,7 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     _discoveryService = widget.discoveryService ?? UdpDiscoveryService();
     _networkService = widget.networkService ?? WebSocketNetworkService();
     _transferQueue = TransferQueueService();
+    _transferQueue.addListener(_onTransferChanged);
     unawaited(_initializeServices());
   }
 
@@ -90,8 +95,14 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
 
   Future<void> _initializeServices() async {
     try {
+      // A killed process leaves its staged picker copies behind, and the transfer
+      // queue is not persisted, so nothing here can be referenced again. The queue
+      // is empty until the user picks a file, so this is safe to run now.
+      unawaited(deletePickedFile(null));
       final downloadDir = widget.dataDirectory?.path ?? await getDownloadDir();
+      if (!mounted) return;
       final stateDir = widget.dataDirectory?.path ?? await getStateDir();
+      if (!mounted) return;
       final stateFile = File(
         '$stateDir${Platform.pathSeparator}.yichuan_state.json',
       );
@@ -101,38 +112,49 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
       if (!await stateFile.exists() && await legacyFile.exists()) {
         await legacyFile.copy(stateFile.path);
       }
+      if (!mounted) return;
       await _deviceRepo.initialize(stateFile);
+      if (!mounted) return;
       _localDeviceId = await _deviceRepo.getOrCreateLocalDeviceId();
+      if (!mounted) return;
       final deviceName = await getLocalDeviceName();
+      if (!mounted) return;
 
       var wsPort = 45678;
       try {
         wsPort = await _networkService.startServer(port: wsPort);
       } catch (_) {
+        if (!mounted) return;
         wsPort = await _networkService.startServer(port: 45679);
       }
 
+      if (!mounted) return;
       _sessionService.generatePairingCode();
       _localIp = await NetworkInfo.getLocalIp();
+      if (!mounted) return;
 
       if (Platform.isAndroid) {
         final granted = await requestNearbyDevicesPermission();
+        if (!mounted) return;
         if (!granted) _statusMessage = '请在系统设置中授予"附近设备"权限';
         final notificationsGranted = await requestNotificationPermission();
+        if (!mounted) return;
         if (!notificationsGranted) {
           _statusMessage = '请允许通知，以便在后台保持设备连接';
         }
         await acquireMulticastLock();
+        if (!mounted) return;
       }
 
       _discoveryService.startScanning();
-      _discoveryService.startBroadcasting(
+      await _discoveryService.startBroadcasting(
         deviceId: _localDeviceId,
         deviceName: deviceName,
         platform: DevicePlatform.current,
         servicePort: wsPort,
       );
 
+      if (!mounted) return;
       _networkService.onClientConnected = (clientId) {
         unawaited(
           _networkService.send(
@@ -187,6 +209,12 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
       }
     } catch (e) {
       if (mounted) setState(() => _statusMessage = '启动失败: $e');
+    } finally {
+      if (!mounted) {
+        await _networkService.stopServer();
+        _discoveryService.dispose();
+        await releaseMulticastLock();
+      }
     }
   }
 
@@ -474,20 +502,25 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
         case ProtocolMessageType.progress:
           if (!_sessionService.authorizes(clientId, message.sessionId)) return;
           final taskId = message.payload['taskId'] as String?;
+          if (taskId == null) return;
+          if (message.payload['failed'] == true) {
+            // The peer gave up on this transfer, so the half-written file and
+            // its open handle must go with it. The queue record is kept so the
+            // user can retry or dismiss it explicitly.
+            final abandoned = _incomingFiles.remove(taskId);
+            _transferQueue.fail(taskId);
+            if (abandoned != null) _discardIncoming(abandoned);
+            return;
+          }
           final receivedBytes = (message.payload['receivedBytes'] as num?)
               ?.toInt();
-          if (taskId != null && receivedBytes != null) {
-            if (message.payload['failed'] == true) {
-              _transferQueue.fail(taskId);
-              return;
-            }
-            _transferQueue.recordProgress(
-              taskId,
-              completedBytes: receivedBytes,
-            );
-            if (message.payload['complete'] == true) {
-              _transferQueue.complete(taskId);
-            }
+          if (receivedBytes == null) return;
+          _transferQueue.recordProgress(
+            taskId,
+            completedBytes: receivedBytes,
+          );
+          if (message.payload['complete'] == true) {
+            _transferQueue.complete(taskId);
           }
 
         case ProtocolMessageType.transferDone:
@@ -527,12 +560,13 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
 
     final existing = _incomingFiles[taskId];
     if (restart) {
+      if (existing?.finalizing == true || existing?.completed == true) return;
       if (existing != null) {
         if (existing.resumeToken != resumeToken) {
           throw const FormatException('Invalid restart token.');
         }
         try {
-          await existing.raf?.close();
+          await existing.cancel();
         } catch (_) {}
         try {
           await File(existing.savePath).delete();
@@ -557,7 +591,7 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     final file = File(savePath);
     file.parent.createSync(recursive: true);
     final raf = file.openSync(mode: FileMode.write);
-    _incomingFiles[taskId] = _IncomingFile(
+    _incomingFiles[taskId] = IncomingTransfer(
       clientId: clientId,
       savePath: savePath,
       raf: raf,
@@ -591,16 +625,27 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     var offset = 0;
 
     if (incoming != null &&
-        incoming.raf == null &&
+        incoming.canResume &&
         incoming.fileName == fileName &&
         incoming.totalBytes == fileSize &&
         incoming.expectedSha256 == fileSha256 &&
         incoming.resumeToken == resumeToken) {
       final partial = File(incoming.savePath);
-      if (await partial.exists() &&
-          await partial.length() == incoming.receivedBytes) {
+      final valid =
+          !incoming.completed || await _completedFileValid(taskId!, incoming);
+      if (!identical(_incomingFiles[taskId], incoming)) return;
+      if (!valid) {
+        _incomingFiles.remove(taskId);
+        _transferQueue.remove(taskId);
+      } else if (incoming.completed ||
+          incoming.finalizing ||
+          (await partial.exists() &&
+              await partial.length() == incoming.receivedBytes)) {
         incoming.clientId = clientId;
-        incoming.raf = await partial.open(mode: FileMode.append);
+        if (!incoming.finalizing && !incoming.completed) {
+          await incoming.resume();
+        }
+        if (!identical(_incomingFiles[taskId], incoming)) return;
         offset = incoming.receivedBytes;
         accepted = true;
         _transferQueue.restart(taskId!, completedBytes: offset);
@@ -659,7 +704,7 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
       chunk = BinaryTransferChunk.decode(frame);
       final incoming = _incomingFiles[chunk.taskId];
       final raf = incoming?.raf;
-      if (incoming == null) return;
+      if (incoming == null || !incoming.acceptsChunks) return;
       if (incoming.clientId != clientId ||
           raf == null ||
           chunk.offset != incoming.receivedBytes ||
@@ -669,8 +714,9 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
       }
       incoming.receiveTime.start();
       incoming.writeTime.start();
-      await raf.writeFrom(chunk.data);
+      await incoming.write(chunk.data);
       incoming.writeTime.stop();
+      if (!identical(_incomingFiles[chunk.taskId], incoming)) return;
       incoming.receivedBytes += chunk.data.length;
       _transferQueue.recordProgress(
         chunk.taskId,
@@ -715,6 +761,43 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     );
   }
 
+  void _onTransferChanged(TransferTask task) {
+    if (_transferQueue.findTask(task.id) != null) return;
+    final incoming = _incomingFiles.remove(task.id);
+    if (incoming == null) return;
+    _discardIncoming(incoming);
+  }
+
+  void _discardIncoming(IncomingTransfer incoming) {
+    final keepFile = incoming.completed;
+    unawaited(() async {
+      try {
+        await incoming.cancel();
+        if (!keepFile && await File(incoming.savePath).exists()) {
+          await File(incoming.savePath).delete();
+        }
+      } catch (_) {
+        // Removal must not resurrect the record if its temporary file is gone.
+      }
+    }());
+  }
+
+  Future<bool> _completedFileValid(
+    String taskId,
+    IncomingTransfer incoming,
+  ) async {
+    try {
+      final uri = _transferQueue.getSavedFileUri(taskId);
+      if (uri != null) return verifySavedFile(uri, incoming.expectedSha256);
+      final file = File(incoming.savePath);
+      return await file.exists() &&
+          await file.length() == incoming.totalBytes &&
+          await widget.fileHasher(file.path) == incoming.expectedSha256;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _handleTransferDone(
     String clientId,
     ProtocolMessage message,
@@ -722,11 +805,37 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     final taskId = message.payload['taskId'] as String;
     final incoming = _incomingFiles[taskId];
     if (incoming == null || incoming.clientId != clientId) return;
-    _incomingFiles.remove(taskId);
+    if (incoming.finalizing) await incoming.finalized.future;
+    if (!identical(_incomingFiles[taskId], incoming)) return;
+    if (incoming.completed) {
+      final valid = await _completedFileValid(taskId, incoming);
+      if (!identical(_incomingFiles[taskId], incoming)) return;
+      if (!valid) {
+        _incomingFiles.remove(taskId);
+        _transferQueue.fail(taskId);
+        await _sendTransferProgress(
+          clientId,
+          taskId,
+          incoming.totalBytes,
+          failed: true,
+        );
+        return;
+      }
+      if (!identical(_incomingFiles[taskId], incoming)) return;
+      _transferQueue.complete(taskId);
+      await _sendTransferProgress(
+        clientId,
+        taskId,
+        incoming.totalBytes,
+        complete: true,
+      );
+      return;
+    }
+    if (!identical(_incomingFiles[taskId], incoming)) return;
+    incoming.beginVerification();
 
     try {
-      await incoming.raf?.close();
-      incoming.raf = null;
+      await incoming.closeWriter();
       if (incoming.receivedBytes != incoming.totalBytes) {
         throw const FormatException(
           'File ended before all bytes were received.',
@@ -738,7 +847,7 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
           expectedSha256 != incoming.expectedSha256) {
         throw const FormatException('Missing or invalid SHA-256.');
       }
-      final digest = await computeFileSha256(incoming.savePath);
+      final digest = await widget.fileHasher(incoming.savePath);
       if (digest != expectedSha256) {
         throw const FormatException('SHA-256 mismatch.');
       }
@@ -749,20 +858,30 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
         name: 'yichuan.transfer.receive',
       );
 
+      if (!identical(_incomingFiles[taskId], incoming)) return;
       final fileName = incoming.savePath.split(Platform.pathSeparator).last;
       if (Platform.isAndroid) {
         final uri = await moveToDownloads(incoming.savePath, fileName);
         if (uri != null) {
           _transferQueue.setSavedFileUri(taskId, uri);
-          _statusMessage = '文件已保存到 Download/驿传/$fileName';
+          if (mounted) {
+            setState(() =>
+                _statusMessage = '文件已保存到 Download/驿传/$fileName');
+          }
         } else {
           _transferQueue.setReceivedFilePath(taskId, incoming.savePath);
-          _statusMessage = '文件已保存(私有目录): $fileName';
+          if (mounted) {
+            setState(() => _statusMessage = '文件已保存(私有目录): $fileName');
+          }
         }
       } else {
         _transferQueue.setReceivedFilePath(taskId, incoming.savePath);
-        _statusMessage = '文件已保存: ${incoming.savePath}';
+        if (mounted) {
+          setState(() => _statusMessage = '文件已保存: ${incoming.savePath}');
+        }
       }
+      if (!identical(_incomingFiles[taskId], incoming)) return;
+      incoming.complete();
       _transferQueue.complete(taskId);
       await _sendTransferProgress(
         clientId,
@@ -771,20 +890,25 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
         complete: true,
       );
     } catch (e) {
+      if (!identical(_incomingFiles[taskId], incoming)) return;
+      incoming.fail();
       try {
-        await incoming.raf?.close();
+        await incoming.closeWriter();
       } catch (_) {}
       try {
         await File(incoming.savePath).delete();
       } catch (_) {}
       _transferQueue.fail(taskId);
-      _statusMessage = '保存文件失败: $e';
+      _incomingFiles.remove(taskId);
+      if (mounted) setState(() => _statusMessage = '保存文件失败: $e');
       await _sendTransferProgress(
         clientId,
         taskId,
         incoming.receivedBytes,
         failed: true,
       );
+    } finally {
+      if (incoming.finalizing) incoming.fail();
     }
     if (mounted) setState(() {});
   }
@@ -792,8 +916,9 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
   Future<void> _failIncoming(String taskId, String message) async {
     final incoming = _incomingFiles.remove(taskId);
     if (incoming == null) return;
+    incoming.fail();
     try {
-      await incoming.raf?.close();
+      await incoming.closeWriter();
     } catch (_) {}
     try {
       await File(incoming.savePath).delete();
@@ -807,8 +932,7 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
         failed: true,
       );
     }
-    _statusMessage = message;
-    if (mounted) setState(() {});
+    if (mounted) setState(() => _statusMessage = message);
   }
 
   Future<void> _suspendIncomingForClient(String clientId) async {
@@ -816,14 +940,15 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
         .where((entry) => entry.value.clientId == clientId)
         .toList();
     for (final entry in incomingFiles) {
+      if (entry.value.finalizing || entry.value.completed) continue;
       try {
-        await entry.value.raf?.close();
+        await entry.value.pause();
       } catch (_) {}
-      entry.value.raf = null;
       _transferQueue.pause(entry.key);
     }
-    if (incomingFiles.isNotEmpty) _statusMessage = '连接中断，已保留未完成文件等待续传';
-    if (mounted) setState(() {});
+    if (incomingFiles.isNotEmpty && mounted) {
+      setState(() => _statusMessage = '连接中断，已保留未完成文件等待续传');
+    }
   }
 
   String _validateFileName(Object? value) {
@@ -879,14 +1004,10 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_stopBackgroundConnectionService());
     for (final incoming in _incomingFiles.values) {
-      try {
-        incoming.raf?.closeSync();
-      } catch (_) {}
-      try {
-        File(incoming.savePath).deleteSync();
-      } catch (_) {}
+      _discardIncoming(incoming);
     }
     _incomingFiles.clear();
+    _transferQueue.removeListener(_onTransferChanged);
     unawaited(_networkService.stopServer());
     _sessionService.removeListener(_onSessionChanged);
     _sessionService.dispose();
@@ -943,27 +1064,4 @@ class _LocalMeshTransferAppState extends State<LocalMeshTransferApp>
       ),
     );
   }
-}
-
-class _IncomingFile {
-  _IncomingFile({
-    required this.clientId,
-    required this.savePath,
-    required this.raf,
-    required this.totalBytes,
-    required this.fileName,
-    required this.expectedSha256,
-    required this.resumeToken,
-  });
-
-  String clientId;
-  final String savePath;
-  RandomAccessFile? raf;
-  final int totalBytes;
-  final String fileName;
-  final String expectedSha256;
-  final String resumeToken;
-  int receivedBytes = 0;
-  final writeTime = Stopwatch();
-  final receiveTime = Stopwatch();
 }

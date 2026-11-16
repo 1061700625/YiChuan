@@ -12,11 +12,13 @@ import '../session/trusted_device.dart';
 class SubnetScanner {
   SubnetScanner({
     this.scanPort = 45678,
+    this.fallbackPort = 45679,
     this.connectionTimeout = const Duration(seconds: 2),
     this.maxConcurrent = 20,
   });
 
   final int scanPort;
+  final int? fallbackPort;
   final Duration connectionTimeout;
   final int maxConcurrent;
 
@@ -32,17 +34,21 @@ class SubnetScanner {
     _scanning = true;
 
     try {
-      final ips = _buildCandidates(ownIp);
+      final ports = {scanPort, if (fallbackPort != null) fallbackPort!};
+      final candidates = [
+        for (final ip in _buildCandidates(ownIp))
+          for (final port in ports) (ip: ip, port: port),
+      ];
       final results = <DiscoveredServiceInfo>[];
 
       // Process in batches to avoid too many concurrent connections
-      for (var i = 0; i < ips.length; i += maxConcurrent) {
-        final end = (i + maxConcurrent < ips.length)
+      for (var i = 0; i < candidates.length; i += maxConcurrent) {
+        final end = (i + maxConcurrent < candidates.length)
             ? i + maxConcurrent
-            : ips.length;
-        final batch = ips.sublist(i, end);
+            : candidates.length;
+        final batch = candidates.sublist(i, end);
         final batchResults = await Future.wait(
-          batch.map((ip) => _tryConnect(ip, scanPort)),
+          batch.map((candidate) => _tryConnect(candidate.ip, candidate.port)),
           eagerError: false,
         );
         results.addAll(batchResults.whereType<DiscoveredServiceInfo>());
@@ -106,61 +112,46 @@ class SubnetScanner {
   }
 
   Future<DiscoveredServiceInfo?> _tryConnect(String ip, int port) async {
+    WebSocket? socket;
     try {
-      final socket = await WebSocket.connect(
+      socket = await WebSocket.connect(
         'ws://$ip:$port',
       ).timeout(connectionTimeout);
-
-      // Try to read the first message (should be a hello announcement)
-      String deviceName = '未知设备 ($ip)';
-      try {
-        // Use a completer to get the first message from the stream
-        final completer = Completer<String>();
-        final sub = socket.listen(
-          (data) {
-            if (!completer.isCompleted) completer.complete(data as String);
-          },
-          onError: (e) {
-            if (!completer.isCompleted) completer.completeError(e);
-          },
-        );
-        final data = await completer.future.timeout(
-          const Duration(seconds: 1),
-          onTimeout: () => '',
-        );
-        await sub.cancel();
-        if (data.isNotEmpty) {
-          final json = jsonDecode(data) as Map<String, Object?>;
-          if (json['type'] == 'hello') {
-            final payload = json['payload'] as Map<String, Object?>?;
-            if (payload != null) {
-              final announcedName = (payload['deviceName'] as String?)?.trim();
-              if (announcedName != null &&
-                  announcedName.isNotEmpty &&
-                  announcedName.toLowerCase() != 'localhost') {
-                deviceName = announcedName;
-              }
-            }
-          }
-        }
-      } catch (_) {
-        // No hello message received, use default name
+      final data = await socket.first.timeout(const Duration(seconds: 1));
+      if (data is! String) return null;
+      final json = jsonDecode(data);
+      if (json is! Map || json['type'] != 'hello' || json['version'] != 1) {
+        return null;
       }
-
-      final info = DiscoveredServiceInfo(
-        deviceId: 'scanned-$ip',
-        deviceName: deviceName,
-        platform: DevicePlatform.macos,
+      final payload = json['payload'];
+      if (payload is! Map) return null;
+      final deviceId = payload['deviceId'];
+      final deviceName = payload['deviceName'];
+      final platform = payload['platform'];
+      if (deviceId is! String ||
+          deviceId.trim().isEmpty ||
+          deviceName is! String ||
+          deviceName.trim().isEmpty ||
+          !DevicePlatform.values.any((value) => value.wireName == platform)) {
+        return null;
+      }
+      return DiscoveredServiceInfo(
+        deviceId: deviceId.trim(),
+        deviceName: deviceName.trim(),
+        platform: DevicePlatform.fromWireName(platform),
         ip: ip,
         port: port,
         protocolVersion: 1,
         discoveredAt: DateTime.now(),
       );
-
-      await socket.close();
-      return info;
     } catch (_) {
       return null;
+    } finally {
+      try {
+        await socket?.close();
+      } catch (_) {
+        // A peer may close while its greeting is being validated.
+      }
     }
   }
 }

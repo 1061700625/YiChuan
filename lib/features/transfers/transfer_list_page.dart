@@ -38,6 +38,7 @@ class _TransferListPageState extends State<TransferListPage> {
   final _progressWaiters = <String, _ProgressWaiter>{};
   final _resumeWaiters = <String, Completer<TransferResumeDecision>>{};
   final _retryingTaskIds = <String>{};
+  ({String client, String session})? _retryConnection;
   final _secureRandom = Random.secure();
 
   @override
@@ -70,6 +71,15 @@ class _TransferListPageState extends State<TransferListPage> {
   }
 
   void _onSessionChanged() {
+    final retry = _retryConnection;
+    if (retry != null && !_sameConnection(retry.client, retry.session)) {
+      final waiters = List.of(_resumeWaiters.values);
+      _resumeWaiters.clear();
+      for (final waiter in waiters) {
+        if (!waiter.isCompleted)
+          waiter.completeError(StateError('连接已断开，请重新配对后重试'));
+      }
+    }
     if (mounted) setState(() {});
   }
 
@@ -88,6 +98,17 @@ class _TransferListPageState extends State<TransferListPage> {
   );
 
   void _onTaskChanged(TransferTask task) {
+    if (widget.transferQueue.findTask(task.id) == null) {
+      final error = StateError('Transfer record was removed.');
+      final progress = _progressWaiters.remove(task.id);
+      if (progress != null && !progress.completer.isCompleted) {
+        progress.completer.completeError(error);
+      }
+      final resume = _resumeWaiters.remove(task.id);
+      if (resume != null && !resume.isCompleted) resume.completeError(error);
+      if (mounted) setState(() {});
+      return;
+    }
     final resumeWaiter = _resumeWaiters[task.id];
     final resumeDecision = widget.transferQueue.takeResumeDecision(task.id);
     if (resumeWaiter != null && resumeDecision != null) {
@@ -178,6 +199,7 @@ class _TransferListPageState extends State<TransferListPage> {
           final hash = await computeFileSha256(file.path);
           // A picker or hash can outlive a session; never send to a different peer.
           if (!_sameConnection(clientId, sessionId)) break;
+          widget.transferQueue.setSentFileSha256(item.id, hash);
           final sent = await widget.networkService.send(
             clientId,
             ProtocolMessage(
@@ -332,6 +354,7 @@ class _TransferListPageState extends State<TransferListPage> {
       return;
     }
 
+    _retryConnection = (client: clientId, session: sessionId);
     setState(() => _retryingTaskIds.add(task.id));
     try {
       final file = File(path);
@@ -339,8 +362,18 @@ class _TransferListPageState extends State<TransferListPage> {
         throw StateError('发送源文件不存在或大小已改变');
       }
       final fileHash = await computeFileSha256(file.path);
+      if (!_sameConnection(clientId, sessionId))
+        throw StateError('连接已改变，请重新配对后重试');
+      if (widget.transferQueue.findTask(task.id) == null)
+        throw StateError('传输记录已删除');
+      final originalHash = widget.transferQueue.getSentFileSha256(task.id);
+      if (originalHash != null && originalHash != fileHash) {
+        throw StateError('源文件已改变，请重新选择文件发起新传输');
+      }
+      widget.transferQueue.setSentFileSha256(task.id, fileHash);
       widget.transferQueue.takeResumeDecision(task.id);
       final resumeCompleter = Completer<TransferResumeDecision>();
+      resumeCompleter.future.ignore();
       _resumeWaiters[task.id] = resumeCompleter;
 
       final requestSent = await widget.networkService.send(
@@ -366,12 +399,16 @@ class _TransferListPageState extends State<TransferListPage> {
       TransferResumeDecision decision;
       try {
         decision = await resumeCompleter.future.timeout(
-          const Duration(seconds: 5),
+          const Duration(minutes: 5),
         );
       } on TimeoutException {
         decision = const TransferResumeDecision(accepted: false, offset: 0);
       }
 
+      if (!_sameConnection(clientId, sessionId))
+        throw StateError('连接已改变，请重新配对后重试');
+      if (widget.transferQueue.findTask(task.id) == null)
+        throw StateError('传输记录已删除');
       var startOffset = 0;
       if (decision.accepted &&
           decision.offset >= 0 &&
@@ -426,6 +463,7 @@ class _TransferListPageState extends State<TransferListPage> {
       }
     } finally {
       _resumeWaiters.remove(task.id);
+      _retryConnection = null;
       if (mounted) setState(() => _retryingTaskIds.remove(task.id));
     }
   }
@@ -441,8 +479,8 @@ class _TransferListPageState extends State<TransferListPage> {
   }) async {
     // Bound queued data while refilling as soon as individual chunks are
     // acknowledged, rather than draining the entire window between batches.
-    const chunkSize = 1024 * 1024;
-    const windowBytes = 8 * 1024 * 1024;
+    const chunkSize = 2 * 1024 * 1024;
+    const windowBytes = 16 * 1024 * 1024;
     RandomAccessFile? raf;
     int offset = startOffset;
     final buffer = Uint8List(chunkSize);
@@ -499,6 +537,7 @@ class _TransferListPageState extends State<TransferListPage> {
       }
     } on TimeoutException {
       widget.transferQueue.fail(taskId);
+      await _reportSendFailure(clientId, sessionId, taskId);
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -507,6 +546,7 @@ class _TransferListPageState extends State<TransferListPage> {
       return;
     } catch (e) {
       widget.transferQueue.fail(taskId);
+      await _reportSendFailure(clientId, sessionId, taskId);
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -552,13 +592,41 @@ class _TransferListPageState extends State<TransferListPage> {
     }
   }
 
+  /// Tell the peer this send did not finish so it can drop its half-written
+  /// file instead of holding a transferring record and an open handle forever.
+  Future<void> _reportSendFailure(
+    String clientId,
+    String sessionId,
+    String taskId,
+  ) async {
+    final task = widget.transferQueue.findTask(taskId);
+    if (task == null) return;
+    await widget.networkService.send(
+      clientId,
+      ProtocolMessage(
+        type: ProtocolMessageType.progress,
+        version: 1,
+        messageId: 'fail_$taskId',
+        sessionId: sessionId,
+        timestamp: DateTime.now(),
+        payload: {
+          'taskId': taskId,
+          'receivedBytes': task.completedBytes,
+          'failed': true,
+        },
+      ),
+    );
+  }
+
   Future<void> _waitForReceiverProgress(String taskId, int targetBytes) {
     final task = widget.transferQueue.findTask(taskId);
     if (task?.status == TransferTaskStatus.failed ||
         task?.status == TransferTaskStatus.paused) {
       return Future.error(StateError('Receiver rejected the file.'));
     }
-    if (task == null || task.completedBytes >= targetBytes) {
+    if (task == null)
+      return Future.error(StateError('Transfer record removed.'));
+    if (task.completedBytes >= targetBytes) {
       return Future.value();
     }
 
@@ -588,20 +656,22 @@ class _TransferListPageState extends State<TransferListPage> {
   }
 
   Future<void> _showDeleteMenu(TransferTask task) async {
-    final selected = await showModalBottomSheet<bool>(
+    final selected = await showDialog<bool>(
       context: context,
-      builder: (sheetContext) => SafeArea(
-        child: ListTile(
-          leading: Icon(
-            Icons.delete_outline,
-            color: Theme.of(sheetContext).colorScheme.error,
+      builder: (sheetContext) => SimpleDialog(
+        children: [
+          ListTile(
+            leading: Icon(
+              Icons.delete_outline,
+              color: Theme.of(sheetContext).colorScheme.error,
+            ),
+            title: Text(
+              '删除',
+              style: TextStyle(color: Theme.of(sheetContext).colorScheme.error),
+            ),
+            onTap: () => Navigator.pop(sheetContext, true),
           ),
-          title: Text(
-            '删除',
-            style: TextStyle(color: Theme.of(sheetContext).colorScheme.error),
-          ),
-          onTap: () => Navigator.pop(sheetContext, true),
-        ),
+        ],
       ),
     );
     if (selected != true || !mounted) return;
@@ -626,7 +696,9 @@ class _TransferListPageState extends State<TransferListPage> {
         ),
       );
       if (confirmed == true && mounted) {
+        final sentPath = widget.transferQueue.getSentFilePath(task.id);
         widget.transferQueue.remove(task.id);
+        if (sentPath != null) unawaited(deletePickedFile(sentPath));
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(const SnackBar(content: Text('已删除记录')));
@@ -704,7 +776,14 @@ class _TransferListPageState extends State<TransferListPage> {
       ),
     );
     if (confirmed != true || !mounted) return;
+    final sentPaths = <String?>[];
+    for (final task in widget.transferQueue.tasks) {
+      sentPaths.add(widget.transferQueue.getSentFilePath(task.id));
+    }
     widget.transferQueue.clear();
+    for (final path in sentPaths) {
+      if (path != null) unawaited(deletePickedFile(path));
+    }
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('已清空传输记录')));

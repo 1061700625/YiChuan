@@ -189,14 +189,7 @@ class _PairingPageState extends State<PairingPage> {
               children: [
                 Text('配对码', style: Theme.of(context).textTheme.titleMedium),
                 const SizedBox(height: 16),
-                Text(
-                  _pairingCode,
-                  style: Theme.of(context).textTheme.displayLarge?.copyWith(
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 8,
-                    color: scheme.primary,
-                  ),
-                ),
+                _PairingCodeView(code: _pairingCode),
                 const SizedBox(height: 8),
                 Text(
                   '在手机上输入此 6 位验证码（5 分钟内有效，过期自动刷新）',
@@ -321,12 +314,16 @@ class _PairingPageState extends State<PairingPage> {
       return;
     }
 
-    setState(() => _scanningNetwork = true);
+    setState(() {
+      widget.discoveryService.clearDiscoveredDevices();
+      _scanningNetwork = true;
+    });
 
     try {
       final found = await _subnetScanner.scan(ownIp: _ownIp);
+      if (!mounted) return;
 
-      if (found.isEmpty && mounted) {
+      if (found.isEmpty && widget.discoveryService.recentDevices.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
@@ -343,6 +340,11 @@ class _PairingPageState extends State<PairingPage> {
             platform: device.platform,
             ip: device.ip,
             port: device.port,
+          );
+        }
+        if (found.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('已重新发现附近设备，可从列表中连接')),
           );
         }
       }
@@ -611,5 +613,34 @@ class _PairingPageState extends State<PairingPage> {
         if (mounted) setState(() => _connecting = false);
       }
     }
+  }
+}
+
+
+/// Renders the six-digit pairing code on a single line.
+///
+/// A fixed [TextStyle] with large [TextStyle.letterSpacing] wrapped the code
+/// onto a second line on narrow high-density phones. [FittedBox] measures the
+/// actual text and scales it to the available width, so the code stays on one
+/// line at every density and font scale.
+class _PairingCodeView extends StatelessWidget {
+  const _PairingCodeView({required this.code});
+
+  final String code;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = Theme.of(context).textTheme.displayLarge?.copyWith(
+      fontWeight: FontWeight.w800,
+      letterSpacing: 8,
+      color: Theme.of(context).colorScheme.primary,
+    );
+    return SizedBox(
+      width: double.infinity,
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Text(code, textAlign: TextAlign.center, style: style),
+      ),
+    );
   }
 }

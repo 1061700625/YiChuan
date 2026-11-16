@@ -160,36 +160,74 @@ class WebSocketNetworkService implements NetworkService {
     }
   }
 
-  Future<void> _listenToClient(String clientId, WebSocket socket) async {
-    try {
-      await for (final data in socket) {
-        await _handleIncomingData(clientId, data);
-      }
-    } catch (_) {
-      // A closed or malformed connection is handled like a normal disconnect.
-    } finally {
-      if (_clients.remove(clientId) != null) {
-        _onClientDisconnected?.call(clientId);
-      }
-      if (_clients.isEmpty) {
-        _state = _server != null
-            ? NetworkConnectionState.listening
-            : NetworkConnectionState.disconnected;
-      }
-    }
-  }
-
-  @override
-  Future<void> disconnect(String clientId) async {
-    final client = _clients.remove(clientId);
-    if (client == null) return;
-    await client.close();
-    _onClientDisconnected?.call(clientId);
+  void _removeClient(String clientId) {
+    if (_clients.remove(clientId) == null) return;
     if (_clients.isEmpty) {
       _state = _server != null
           ? NetworkConnectionState.listening
           : NetworkConnectionState.disconnected;
     }
+    _onClientDisconnected?.call(clientId);
+  }
+
+  Future<void> _listenToClient(String clientId, WebSocket socket) {
+    const maxPendingBytes = 32 * 1024 * 1024;
+    // Zero-byte frames carry no byte cost, so the byte cap alone cannot bound a
+    // peer that floods empty frames. The sender emits 2 MiB chunks inside a
+    // 16 MiB window, so 16 pending frames comfortably covers a healthy transfer
+    // (and still 32 MiB of bytes). Keep this in sync with chunkSize/windowBytes
+    // in _sendFileChunks.
+    const maxPendingFrames = 16;
+    var pendingBytes = 0;
+    var pendingFrames = 0;
+    var pending = Future<void>.value();
+    final closed = Completer<void>();
+    void finish() {
+      _removeClient(clientId);
+      if (!closed.isCompleted) closed.complete();
+    }
+
+    socket.listen(
+      (dynamic data) {
+        if (!identical(_clients[clientId], socket)) return;
+        final bytes = data is String
+            ? data.length * 2
+            : (data as List<int>).length;
+        if (bytes > maxPendingBytes - pendingBytes ||
+            pendingFrames >= maxPendingFrames) {
+          finish();
+          unawaited(
+            socket.close(WebSocketStatus.policyViolation, 'Receive queue full'),
+          );
+          return;
+        }
+        pendingBytes += bytes;
+        pendingFrames++;
+        // Keep reading transport events while serializing disk/protocol operations.
+        pending = pending.then((_) async {
+          try {
+            if (identical(_clients[clientId], socket)) {
+              await _handleIncomingData(clientId, data);
+            }
+          } finally {
+            pendingBytes -= bytes;
+            pendingFrames--;
+          }
+        });
+      },
+      onDone: finish,
+      onError: (Object _) => finish(),
+      cancelOnError: true,
+    );
+    return closed.future;
+  }
+
+  @override
+  Future<void> disconnect(String clientId) async {
+    final client = _clients[clientId];
+    if (client == null) return;
+    _removeClient(clientId);
+    await client.close();
   }
 
   @override

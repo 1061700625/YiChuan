@@ -4,13 +4,27 @@ import 'dart:io';
 
 import 'discovery_service.dart';
 import '../session/trusted_device.dart';
+import '../platform/network_info.dart';
 
 class UdpDiscoveryService extends DiscoveryService {
-  UdpDiscoveryService({super.discoveryTtl});
+  UdpDiscoveryService({
+    super.discoveryTtl,
+    Duration listenRetryDelay = const Duration(seconds: 1),
+    Future<RawDatagramSocket> Function(InternetAddress, int)?
+    receiveSocketBinder,
+  }) : _listenRetryDelay = listenRetryDelay,
+       _receiveSocketBinder = receiveSocketBinder ?? RawDatagramSocket.bind;
 
+  final Duration _listenRetryDelay;
+  final Future<RawDatagramSocket> Function(InternetAddress, int)
+  _receiveSocketBinder;
+
+  int _generation = 0;
+  bool _disposed = false;
   RawDatagramSocket? _sendSocket;
   RawDatagramSocket? _receiveSocket;
   Timer? _broadcastTimer;
+  Timer? _listenRetryTimer;
   StreamSubscription<RawSocketEvent>? _receiveSubscription;
 
   static const _broadcastPort = 45677;
@@ -18,12 +32,19 @@ class UdpDiscoveryService extends DiscoveryService {
 
   /// Start broadcasting local service info via UDP.
   /// Called on the desktop (server) side.
+  ///
+  /// The send socket is pinned to the LAN address. A phone that is on both
+  /// WiFi and mobile data otherwise picks its outgoing interface from the
+  /// default route (cellular), so a 255.255.255.255 datagram never reaches the
+  /// desktop. A wildcard send socket also picks the wrong interface.
   Future<void> startBroadcasting({
     required String deviceId,
     required String deviceName,
     required DevicePlatform platform,
     required int servicePort,
   }) async {
+    if (_disposed) return;
+    final generation = _generation;
     publishService(
       deviceId: deviceId,
       deviceName: deviceName,
@@ -31,8 +52,16 @@ class UdpDiscoveryService extends DiscoveryService {
       port: servicePort,
     );
 
-    // Bind send socket to a random ephemeral port
-    _sendSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    final localAddress = await NetworkInfo.getLocalIp();
+    final boundAddress = localAddress == null || localAddress.isEmpty
+        ? InternetAddress.anyIPv4
+        : (InternetAddress.tryParse(localAddress) ?? InternetAddress.anyIPv4);
+    final socket = await RawDatagramSocket.bind(boundAddress, 0);
+    if (_disposed || generation != _generation) {
+      socket.close();
+      return;
+    }
+    _sendSocket = socket;
     _sendSocket!.broadcastEnabled = true;
 
     // Send discovery broadcast every 5 seconds
@@ -62,18 +91,27 @@ class UdpDiscoveryService extends DiscoveryService {
 
   @override
   void startScanning() {
+    if (_disposed || isScanning) return;
     super.startScanning(); // starts cleanup timer
     _startListening();
   }
 
   Future<void> _startListening() async {
-    if (_receiveSocket != null) return; // already listening
+    if (_receiveSocket != null || _disposed) return; // already listening
 
+    final generation = _generation;
     try {
-      _receiveSocket = await RawDatagramSocket.bind(
+      final socket = await _receiveSocketBinder(
         InternetAddress.anyIPv4,
         _broadcastPort,
       );
+      if (_disposed || generation != _generation) {
+        socket.close();
+        return;
+      }
+      _receiveSocket = socket;
+      _listenRetryTimer?.cancel();
+      _listenRetryTimer = null;
       _receiveSocket!.broadcastEnabled = true;
 
       _receiveSubscription = _receiveSocket!.listen((event) {
@@ -110,15 +148,24 @@ class UdpDiscoveryService extends DiscoveryService {
         }
       });
     } catch (_) {
-      // Binding failed (e.g., port in use) — discovery will work via retry
       _receiveSocket = null;
+      if (_disposed || generation != _generation || !isScanning) return;
+      _listenRetryTimer?.cancel();
+      _listenRetryTimer = Timer(_listenRetryDelay, () {
+        _listenRetryTimer = null;
+        unawaited(_startListening());
+      });
     }
   }
 
   @override
   void stopScanning() {
+    _generation++;
     _broadcastTimer?.cancel();
     _broadcastTimer = null;
+
+    _listenRetryTimer?.cancel();
+    _listenRetryTimer = null;
 
     _receiveSubscription?.cancel();
     _receiveSubscription = null;
@@ -133,6 +180,7 @@ class UdpDiscoveryService extends DiscoveryService {
   }
 
   void dispose() {
+    _disposed = true;
     stopScanning();
   }
 }

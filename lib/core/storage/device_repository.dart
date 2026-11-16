@@ -8,6 +8,7 @@ class DeviceRepository {
   final _store = <String, TrustedDevice>{};
   final _listeners = <void Function()>{};
   File? _storageFile;
+  Future<void> _pendingWrite = Future<void>.value();
   String? _localDeviceId;
 
   void addListener(void Function() listener) => _listeners.add(listener);
@@ -40,16 +41,17 @@ class DeviceRepository {
     _notify();
   }
 
-  Future<String> getOrCreateLocalDeviceId() async {
+  Future<String> getOrCreateLocalDeviceId() => _enqueue(() async {
     if (_localDeviceId != null) return _localDeviceId!;
     final random = Random.secure();
-    final bytes = List<int>.generate(16, (_) => random.nextInt(256));
-    _localDeviceId = bytes
-        .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
-        .join();
-    await _persist();
-    return _localDeviceId!;
-  }
+    final id = List.generate(
+      16,
+      (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+    ).join();
+    await _writeSnapshot(_store, localDeviceId: id);
+    _localDeviceId = id;
+    return id;
+  });
 
   Future<TrustedDevice?> findById(String id) async {
     return _store[id];
@@ -59,31 +61,50 @@ class DeviceRepository {
     return _store.values.toList(growable: false);
   }
 
-  Future<void> save(TrustedDevice device) async {
+  Future<void> save(TrustedDevice device) => _enqueue(() async {
+    final next = Map<String, TrustedDevice>.of(_store)..[device.id] = device;
+    await _writeSnapshot(next);
     _store[device.id] = device;
-    await _persist();
     _notify();
-  }
+  });
 
-  Future<void> delete(String id) async {
+  Future<void> delete(String id) => _enqueue(() async {
+    final next = Map<String, TrustedDevice>.of(_store)..remove(id);
+    await _writeSnapshot(next);
     _store.remove(id);
-    await _persist();
     _notify();
+  });
+
+  Future<T> _enqueue<T>(Future<T> Function() action) {
+    if (_storageFile == null) return action();
+    final operation = _pendingWrite.then((_) => action());
+    _pendingWrite = operation.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return operation;
   }
 
-  Future<void> _persist() async {
+  Future<void> _writeSnapshot(
+    Map<String, TrustedDevice> devices, {
+    String? localDeviceId,
+  }) async {
     final file = _storageFile;
     if (file == null) return;
+    final snapshot = jsonEncode({
+      'localDeviceId': localDeviceId ?? _localDeviceId,
+      'trustedDevices': devices.values
+          .map((device) => device.toJson())
+          .toList(),
+    });
     await file.parent.create(recursive: true);
-    await file.writeAsString(
-      jsonEncode({
-        'localDeviceId': _localDeviceId,
-        'trustedDevices': _store.values
-            .map((device) => device.toJson())
-            .toList(),
-      }),
-      flush: true,
-    );
+    final temporary = File('${file.path}.tmp');
+    try {
+      await temporary.writeAsString(snapshot, flush: true);
+      await temporary.rename(file.path);
+    } finally {
+      if (await temporary.exists()) await temporary.delete();
+    }
   }
 
   void _notify() {
