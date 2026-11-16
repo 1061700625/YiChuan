@@ -13,7 +13,8 @@ import 'package:local_mesh_transfer/core/transfer/transfer_queue_service.dart';
 import 'package:local_mesh_transfer/features/transfers/transfer_list_page.dart';
 
 class _AcknowledgingNetwork extends InMemoryNetworkService {
-  _AcknowledgingNetwork(this.queue);
+  _AcknowledgingNetwork(this.queue, {this.completeOnDone = true});
+  final bool completeOnDone;
   final TransferQueueService queue;
   @override
   Future<bool> sendBinary(String clientId, Uint8List data) async {
@@ -30,9 +31,21 @@ class _AcknowledgingNetwork extends InMemoryNetworkService {
   @override
   Future<bool> send(String clientId, ProtocolMessage message) async {
     final sent = await super.send(clientId, message);
-    if (sent && message.type == ProtocolMessageType.transferDone) {
+    if (completeOnDone &&
+        sent &&
+        message.type == ProtocolMessageType.transferDone) {
       queue.complete(message.payload['taskId'] as String);
     }
+    return sent;
+  }
+}
+
+class _WindowNetwork extends InMemoryNetworkService {
+  bool done = false;
+  @override
+  Future<bool> send(String clientId, ProtocolMessage message) async {
+    final sent = await super.send(clientId, message);
+    if (message.type == ProtocolMessageType.transferDone) done = true;
     return sent;
   }
 }
@@ -173,8 +186,10 @@ void main() {
       final messenger =
           TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
       messenger.setMockMethodCallHandler(channel, (call) async {
-        if (call.method == 'pickFile')
-          return {'path': file.path, 'name': 'sample.bin', 'size': 4};
+        if (call.method == 'pickFiles')
+          return [
+            {'path': file.path, 'name': 'sample.bin', 'size': 4},
+          ];
         return null;
       });
       addTearDown(() {
@@ -239,6 +254,298 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  for (final removed in [false, true]) {
+    testWidgets(
+      '${removed ? 'record removal' : 'connection loss'} during verification releases the sender without waiting for timeout',
+      (tester) async {
+        final directory = Directory.systemTemp.createTempSync(
+          'yichuan-send-test-',
+        );
+        final file = File('${directory.path}/sample.bin')
+          ..writeAsBytesSync([1, 2, 3, 4]);
+        const channel = MethodChannel('com.localmesh/filepicker');
+        final messenger =
+            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+        messenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'pickFiles')
+            return [
+              {'path': file.path, 'name': 'sample.bin', 'size': 4},
+            ];
+          return null;
+        });
+        addTearDown(() {
+          messenger.setMockMethodCallHandler(channel, null);
+          directory.deleteSync(recursive: true);
+        });
+        final queue = TransferQueueService();
+        queue.addOffer(
+          taskId: 'incoming',
+          fileName: 'other.bin',
+          fileSize: 100,
+        );
+        queue.markReceived('incoming');
+        queue.startTransfer('incoming');
+        final network = _AcknowledgingNetwork(queue, completeOnDone: false);
+        final client = await network.injectClientConnection(
+          deviceId: 'phone',
+          deviceName: 'Phone',
+          host: '127.0.0.1',
+        );
+        final session = SessionService(deviceRepo: DeviceRepository());
+        await session.acceptPairResult(
+          clientId: client,
+          sessionId: 'session',
+          peerDeviceId: 'phone',
+          peerDeviceName: 'Phone',
+          peerPlatform: DevicePlatform.android,
+        );
+        expect(network.isInitiator, isFalse);
+        await tester.pumpWidget(
+          MaterialApp(
+            home: TransferListPage(
+              transferQueue: queue,
+              networkService: network,
+              sessionService: session,
+            ),
+          ),
+        );
+        await tester.tap(find.text('发送文件'));
+        for (
+          var attempt = 0;
+          attempt < 100 &&
+              !queue.tasks.any(
+                (task) =>
+                    !queue.isReceived(task.id) &&
+                    task.status.name == 'verifying',
+              );
+          attempt++
+        ) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        final sent = queue.tasks.singleWhere(
+          (task) => !queue.isReceived(task.id),
+        );
+        expect(sent.status.name, 'verifying');
+        for (
+          var attempt = 0;
+          attempt < 100 &&
+              !network.messageLog.any(
+                (m) => m.type == ProtocolMessageType.transferDone,
+              );
+          attempt++
+        ) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        expect(
+          network.messageLog.any(
+            (m) => m.type == ProtocolMessageType.transferDone,
+          ),
+          isTrue,
+        );
+        if (removed)
+          queue.remove(sent.id);
+        else
+          queue.pause(sent.id);
+        for (
+          var attempt = 0;
+          attempt < 100 && find.text('发送队列中…').evaluate().isNotEmpty;
+          attempt++
+        ) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        expect(find.text('发送队列中…'), findsNothing);
+        if (removed) {
+          expect(queue.findTask(sent.id), isNull);
+        } else {
+          expect(queue.findTask(sent.id)!.status, TransferTaskStatus.failed);
+        }
+        expect(sent.completedBytes, 4);
+        if (!removed) {
+          expect(
+            queue.getSentFileSha256(sent.id),
+            network.messageLog
+                .firstWhere(
+                  (message) =>
+                      message.type == ProtocolMessageType.transferOffer,
+                )
+                .payload['fileSha256'],
+          );
+        }
+        final frame = BinaryTransferChunk.decode(
+          network.binaryMessageLog.single,
+        );
+        expect(frame.data, orderedEquals([1, 2, 3, 4]));
+        expect(
+          queue.findTask('incoming')!.status,
+          TransferTaskStatus.transferring,
+        );
+        await tester.pumpWidget(const SizedBox());
+      },
+    );
+  }
+
+  testWidgets(
+    'sliding window sends 2 MiB chunks and refills on partial acknowledgment',
+    (tester) async {
+      final directory = Directory.systemTemp.createTempSync(
+        'yichuan-send-test-',
+      );
+      final file = File('${directory.path}/sample.bin')
+        ..writeAsBytesSync(
+          List<int>.generate(20 * 1024 * 1024 + 17, (i) => i % 251),
+        );
+      const channel = MethodChannel('com.localmesh/filepicker');
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'pickFiles')
+          return [
+            {
+              'path': file.path,
+              'name': 'sample.bin',
+              'size': file.lengthSync(),
+            },
+          ];
+        return null;
+      });
+      addTearDown(() {
+        messenger.setMockMethodCallHandler(channel, null);
+        directory.deleteSync(recursive: true);
+      });
+      final queue = TransferQueueService();
+      queue.addOffer(taskId: 'incoming', fileName: 'other.bin', fileSize: 100);
+      queue.markReceived('incoming');
+      queue.startTransfer('incoming');
+      final network = _WindowNetwork();
+      final client = await network.injectClientConnection(
+        deviceId: 'phone',
+        deviceName: 'Phone',
+        host: '127.0.0.1',
+      );
+      final session = SessionService(deviceRepo: DeviceRepository());
+      await session.acceptPairResult(
+        clientId: client,
+        sessionId: 'session',
+        peerDeviceId: 'phone',
+        peerDeviceName: 'Phone',
+        peerPlatform: DevicePlatform.android,
+      );
+      expect(network.isInitiator, isFalse);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TransferListPage(
+            transferQueue: queue,
+            networkService: network,
+            sessionService: session,
+          ),
+        ),
+      );
+      await tester.tap(find.text('发送文件'));
+      Future<void> until(bool Function() condition) async {
+        for (var attempt = 0; attempt < 300 && !condition(); attempt++) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        expect(condition(), isTrue);
+      }
+
+      await until(() => network.binaryMessageLog.length >= 1);
+      expect(
+        BinaryTransferChunk.decode(network.binaryMessageLog.first).data.length,
+        2 * 1024 * 1024,
+      );
+      await until(() => network.binaryMessageLog.length == 8);
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 30)),
+      );
+      expect(
+        network.binaryMessageLog.length,
+        8,
+        reason: 'Unconfirmed data must stay bounded.',
+      );
+      final task = queue.tasks.singleWhere((t) => !queue.isReceived(t.id));
+      queue.recordProgress(task.id, completedBytes: 2 * 1024 * 1024);
+      await until(() => network.binaryMessageLog.length == 9);
+      expect(network.done, isFalse);
+      queue.recordProgress(task.id, completedBytes: 16 * 1024 * 1024);
+      await until(() => network.binaryMessageLog.length == 11);
+      queue.recordProgress(task.id, completedBytes: file.lengthSync());
+      await until(() => network.done);
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(find.text('校验中'), findsOneWidget);
+      expect(find.text('已完成'), findsNothing);
+      var offset = 0;
+      for (final frame in network.binaryMessageLog) {
+        final chunk = BinaryTransferChunk.decode(frame);
+        expect(chunk.offset, offset);
+        expect(
+          chunk.data,
+          orderedEquals(
+            List<int>.generate(chunk.data.length, (i) => (offset + i) % 251),
+          ),
+        );
+        offset += chunk.data.length;
+      }
+      expect(offset, file.lengthSync());
+      queue.complete(task.id);
+      await tester.pump();
+      expect(find.text('已完成'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets('throttles byte updates but immediately shows verification', (
+    tester,
+  ) async {
+    final queue = TransferQueueService();
+    queue.addOffer(
+      taskId: 'file',
+      fileName: 'large.bin',
+      fileSize: 10 * 1024 * 1024,
+    );
+    queue.startTransfer('file');
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TransferListPage(
+          transferQueue: queue,
+          networkService: InMemoryNetworkService(),
+          sessionService: SessionService(deviceRepo: DeviceRepository()),
+        ),
+      ),
+    );
+    double? progress() => tester
+        .widget<LinearProgressIndicator>(find.byType(LinearProgressIndicator))
+        .value;
+    queue.recordProgress('file', completedBytes: 1024 * 1024);
+    await tester.pump();
+    expect(progress(), 0);
+    await tester.pump(const Duration(milliseconds: 100));
+    queue.recordProgress('file', completedBytes: 2 * 1024 * 1024);
+    await tester.pump();
+    expect(progress(), 0);
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(progress(), .2);
+    queue.recordProgress('file', completedBytes: 10 * 1024 * 1024);
+    await tester.pump();
+    expect(find.text('校验中'), findsOneWidget);
+    expect(progress(), isNull);
+    queue.complete('file');
+    await tester.pump();
+    expect(find.text('已完成'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+  });
 
   testWidgets('unpaired sockets cannot enable sending', (tester) async {
     final network = InMemoryNetworkService();

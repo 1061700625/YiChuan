@@ -20,6 +20,64 @@ void main() {
       expect(await repo.findById(device.id), isNull);
     });
 
+    test('concurrent changes persist the latest complete snapshot', () async {
+      final dir = await Directory.systemTemp.createTemp('yichuan-concurrent-');
+      addTearDown(() => dir.delete(recursive: true));
+      final file = File('${dir.path}/state.json');
+      final repo = DeviceRepository();
+      await repo.initialize(file);
+      await repo.getOrCreateLocalDeviceId();
+      await Future.wait(
+        List.generate(
+          40,
+          (i) => repo.save(
+            TrustedDevice(
+              id: '$i',
+              name: 'Device $i',
+              platform: DevicePlatform.android,
+            ),
+          ),
+        ),
+      );
+      final restored = DeviceRepository();
+      await restored.initialize(file);
+      expect(await restored.findAll(), hasLength(40));
+    });
+
+    test('failed temporary write leaves previous credentials intact', () async {
+      final dir = await Directory.systemTemp.createTemp('yichuan-atomic-');
+      addTearDown(() => dir.delete(recursive: true));
+      final file = File('${dir.path}/state.json');
+      final repo = DeviceRepository();
+      await repo.initialize(file);
+      await repo.getOrCreateLocalDeviceId();
+      final previous = await file.readAsString();
+      await Directory('${file.path}.tmp').create();
+      await expectLater(
+        repo.save(
+          const TrustedDevice(
+            id: 'new',
+            name: 'New',
+            platform: DevicePlatform.android,
+          ),
+        ),
+        throwsA(isA<FileSystemException>()),
+      );
+      expect(await file.readAsString(), previous);
+      expect(await repo.findById('new'), isNull);
+      await Directory('${file.path}.tmp').delete();
+      await repo.save(
+        const TrustedDevice(
+          id: 'next',
+          name: 'Next',
+          platform: DevicePlatform.android,
+        ),
+      );
+      final restored = DeviceRepository();
+      await restored.initialize(file);
+      expect(await restored.findById('next'), isNotNull);
+    });
+
     test('persists the local ID and trusted devices', () async {
       final directory = await Directory.systemTemp.createTemp('yichuan_repo_');
       addTearDown(() => directory.delete(recursive: true));

@@ -19,7 +19,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('驿传 v1.0.3'));
+    await tester.tap(find.text('驿传 v1.0.5'));
     await tester.pump();
 
     expect(openedUrl, projectGitHubUrl);

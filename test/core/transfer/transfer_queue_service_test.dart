@@ -29,7 +29,7 @@ void main() {
 
       final task = queue.findTask('t1')!;
       expect(task.completedBytes, 100);
-      expect(task.status, TransferTaskStatus.transferring);
+      expect(task.status, TransferTaskStatus.verifying);
     });
 
     test('completes only after explicit integrity confirmation', () {
@@ -39,6 +39,19 @@ void main() {
       queue.complete('t1');
       expect(queue.findTask('t1')!.status, TransferTaskStatus.completed);
     });
+
+    test(
+      'received all bytes enters verification until integrity confirmation',
+      () {
+        queue.addOffer(taskId: 't1', fileName: 'f.bin', fileSize: 100);
+        queue.startTransfer('t1');
+        queue.recordProgress('t1', completedBytes: 100);
+        expect(queue.findTask('t1')!.status.name, 'verifying');
+        queue.complete('t1');
+        queue.recordProgress('t1', completedBytes: 90);
+        expect(queue.findTask('t1')!.status, TransferTaskStatus.completed);
+      },
+    );
 
     test('marks a transfer failed', () {
       queue.addOffer(taskId: 't1', fileName: 'f.bin', fileSize: 100);
@@ -56,6 +69,12 @@ void main() {
 
       expect(queue.findTask('t1')!.completedBytes, 48);
       expect(queue.findTask('t1')!.status, TransferTaskStatus.transferring);
+    });
+
+    test('resuming all file bytes still requires verification', () {
+      queue.addOffer(taskId: 't1', fileName: 'f.bin', fileSize: 100);
+      queue.restart('t1', completedBytes: 100);
+      expect(queue.findTask('t1')!.status, TransferTaskStatus.verifying);
     });
 
     test('delivers a resume decision once', () {

@@ -14,7 +14,7 @@ void main() {
 
       expect(received.completedBytes, 100);
       expect(received.progress, 1);
-      expect(received.status, TransferTaskStatus.transferring);
+      expect(received.status, TransferTaskStatus.verifying);
       expect(received.markCompleted().status, TransferTaskStatus.completed);
     });
 
